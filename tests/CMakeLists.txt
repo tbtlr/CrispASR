@@ -257,6 +257,47 @@ catch_discover_tests(test-stream-vad-merge-policy
     PROPERTIES LABELS "unit;stream-json"
 )
 
+# DFN3 streaming post-filter — FFT round-trip sanity. No model load,
+# no audio; pure numerics. Only built when the post-filter is on.
+if (CRISPASR_DFN)
+    # Compile dfn_fft.cpp directly into the test — the symbols live
+    # behind the library's hidden default visibility, so we'd otherwise
+    # have to decorate them with CA_EXPORT (not desired; they're meant
+    # to be internal).
+    add_executable(test-dfn-fft
+        test-dfn-fft.cpp
+        ${PROJECT_SOURCE_DIR}/src/dfn_fft.cpp
+    )
+    target_include_directories(test-dfn-fft PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/include
+    )
+    target_link_libraries(test-dfn-fft PRIVATE
+        crispasr
+        Catch2::Catch2WithMain
+    )
+    catch_discover_tests(test-dfn-fft
+        TEST_SPEC "[unit]"
+        PROPERTIES LABELS "unit;dfn"
+    )
+
+    # DFN3 GGML graph golden-value validation. Tagged [.dfn-golden] so
+    # CI doesn't run it; locally provide CRISPASR_DFN_GGUF +
+    # CRISPASR_DFN_GOLDEN environment vars (see test-dfn-graph.cpp).
+    add_executable(test-dfn-graph
+        test-dfn-graph.cpp
+    )
+    target_include_directories(test-dfn-graph PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/include
+    )
+    target_link_libraries(test-dfn-graph PRIVATE
+        crispasr
+        ggml
+        Catch2::Catch2WithMain
+    )
+endif()
+
 # JSON streaming punctuation policy (PR #112). Pure string-to-bool
 # predicate covered exhaustively; no model load, no audio.
 add_executable(test-stream-punc

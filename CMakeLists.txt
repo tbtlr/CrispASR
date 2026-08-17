@@ -259,6 +259,7 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/crispasr.pc"
 #
 
 add_subdirectory(crisp_audio)
+add_subdirectory(tools)
 
 if (CRISPASR_BUILD_TESTS AND NOT CMAKE_JS_VERSION)
     include(CTest)

@@ -190,6 +190,23 @@ if (NOT MSVC)
     target_compile_definitions(crispasr PRIVATE CRISPASR_RNNOISE=1)
 endif()
 
+# DeepFilterNet3 streaming TTS post-filter (PLAN: flickering-greeting-backus).
+# Optional GGML-backed denoiser hooked into the session TTS callback;
+# scrubs the background-music artefacts VibeVoice realtime hallucinates
+# on phrases like "Hello there" and bumps output to 48 kHz.
+option(CRISPASR_DFN "Build DeepFilterNet3 TTS post-filter" ON)
+if (CRISPASR_DFN)
+    target_sources(crispasr PRIVATE
+        dfn.h
+        dfn.cpp
+        dfn_debug.h
+        dfn_fft.h
+        dfn_fft.cpp
+        audio_resample.h
+    )
+    target_compile_definitions(crispasr PRIVATE CRISPASR_DFN=1)
+endif()
+
 # RNNoise's C sources predate the strict implicit-decl errors that
 # clang 16+ defaults to. Silence those warnings on a per-file basis
 # rather than relaxing global -Werror policy.

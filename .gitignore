@@ -71,6 +71,7 @@ models/*.mlmodelc
 models/*.mlpackage
 models/*-encoder-openvino.xml
 models/*-encoder-openvino-cache/
+models/deepfilternet3*.gguf  # produced by convert-deepfilternet-to-gguf.py / dump-deepfilternet-golden.py
 bindings/java/.gradle/
 bindings/java/.idea/
 .idea/

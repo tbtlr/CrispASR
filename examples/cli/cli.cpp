@@ -548,6 +548,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.chat_n_gpu_layers = std::stoi(ARGV_NEXT);
     } else if (arg == "--tts-trim-silence") {
         params.tts_trim_silence = true;
+    } else if (arg == "--tts-postfilter") {
+        params.tts_postfilter = ARGV_NEXT;
     } else if (arg == "--text") {
         params.text_input = ARGV_NEXT;
     } else if (arg == "--translate-max-tokens") {
@@ -1043,6 +1045,10 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_steps);
     fprintf(stderr, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
+    fprintf(stderr,
+            "             --tts-postfilter PATH     [%-7s] DeepFilterNet3 GGUF: run synthesised PCM through "
+            "the post-filter and write 48 kHz mono WAV (default: off, native 24 kHz pass-through)\n",
+            params.tts_postfilter.empty() ? "off" : "on");
     // Text-to-text translation (m2m100)
     fprintf(stderr, "\nText-to-text translation (m2m100) options:\n");
     fprintf(stderr, "             --text \"TEXT\"           translate TEXT and write result to stdout "

@@ -261,6 +261,14 @@ struct whisper_params {
     std::string tts_ref_text;
     std::string tts_instruct; // VoiceDesign: natural-language voice description
     bool tts_trim_silence = false;
+    // Path to a DeepFilterNet3 GGUF (produced by
+    // models/convert-deepfilternet-to-gguf.py). When non-empty, the
+    // synthesised PCM is upsampled 24→48 kHz and run through the DFN
+    // post-filter before the WAV is written — gives an immediate A/B
+    // for the "Hello there" / "Good morning" background-music
+    // artefacts VibeVoice realtime occasionally hallucinates. Empty
+    // (default) keeps the legacy 24 kHz path.
+    std::string tts_postfilter;
 
     // Server mode: directory containing voice profiles for /v1/audio/speech.
     // Each profile is a sibling pair: <name>.wav + <name>.txt (the WAV is

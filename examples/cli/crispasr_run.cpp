@@ -39,6 +39,12 @@
 
 #include "common-crispasr.h" // read_audio_data
 
+#if __has_include("dfn.h")
+#include "audio_resample.h" // 24 → 48 kHz polyphase
+#include "dfn.h"             // optional DeepFilterNet3 TTS post-filter
+#define CRISPASR_CLI_HAVE_DFN 1
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -1357,14 +1363,90 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
         }
 
-        // Write output WAV (backend-native sample rate, mono)
+        // ── Optional DeepFilterNet3 post-filter (--tts-postfilter PATH) ──
+        // Upsample sr_in → 48 kHz, run through DFN, write 48 kHz mono.
+        // The streaming session path in src/dfn.cpp does the same work
+        // per 10 ms chunk; the CLI batch path applies it after the
+        // whole synthesis is done since this is one-shot offline TTS.
+        int sr_out = sr_in;
+#ifdef CRISPASR_CLI_HAVE_DFN
+        if (!params.tts_postfilter.empty()) {
+            dfn_params dp = dfn_default_params();
+            dp.verbosity  = params.no_prints ? 0 : 1;
+            dfn_model* dfn_m = dfn_model_load(params.tts_postfilter.c_str(), dp);
+            if (!dfn_m) {
+                fprintf(stderr, "crispasr: --tts-postfilter: failed to load '%s'\n",
+                        params.tts_postfilter.c_str());
+                return 17;
+            }
+            const int sr_dfn = dfn_model_sample_rate(dfn_m);
+            audio_resampler* up = audio_resampler_create(sr_in, sr_dfn, /*channels=*/1, /*algo=*/1);
+            if (!up) {
+                dfn_model_free(dfn_m);
+                fprintf(stderr, "crispasr: --tts-postfilter: resampler init failed\n");
+                return 17;
+            }
+            // Stream input through resampler in 4096-frame chunks, then
+            // through DFN. Output gets concatenated.
+            dfn_stream* dfns = dfn_stream_create(dfn_m);
+            // Pre-warm the EMA + GRU states with 1 s of silence — the
+            // upstream `enhance.py` processes audio as one batch, so
+            // its EMAs converge inside the model call. Streaming with
+            // persistent state would otherwise spend the first ~1 s
+            // of *real* audio chasing its initial state and produce
+            // audible warm-up distortion.
+            dfn_stream_warmup(dfns, /*n_frames=*/100);
+            std::vector<float> out;
+            out.reserve(audio.size() * sr_dfn / sr_in + 16384);
+            const int             in_chunk = 4096;
+            std::vector<float>    up_buf(in_chunk * 4 + 64);
+            std::vector<float>    dfn_buf(up_buf.size() * 2);
+            for (size_t i = 0; i < audio.size(); i += (size_t)in_chunk) {
+                int n_in = (int)std::min((size_t)in_chunk, audio.size() - i);
+                int in_used = 0, up_written = 0;
+                if (audio_resampler_process(up, audio.data() + i, n_in, up_buf.data(), (int)up_buf.size(),
+                                            &in_used, &up_written) != 0)
+                    break;
+                int produced = 0;
+                if (dfn_stream_process(dfns, up_buf.data(), up_written, dfn_buf.data(), (int)dfn_buf.size(),
+                                       &produced, /*final_chunk=*/false) != 0)
+                    break;
+                out.insert(out.end(), dfn_buf.begin(), dfn_buf.begin() + produced);
+            }
+            // Drain.
+            int in_used = 0, up_written = 0;
+            audio_resampler_process(up, nullptr, 0, up_buf.data(), (int)up_buf.size(), &in_used, &up_written);
+            int produced = 0;
+            dfn_stream_process(dfns, up_buf.data(), up_written, dfn_buf.data(), (int)dfn_buf.size(), &produced,
+                               /*final_chunk=*/true);
+            out.insert(out.end(), dfn_buf.begin(), dfn_buf.begin() + produced);
+
+            audio_resampler_free(up);
+            dfn_stream_free(dfns);
+            dfn_model_free(dfn_m);
+
+            if (!params.no_prints)
+                fprintf(stderr,
+                        "crispasr: tts-postfilter: %zu → %zu samples, %d → %d Hz\n", audio.size(), out.size(), sr_in,
+                        sr_dfn);
+            audio  = std::move(out);
+            sr_out = sr_dfn;
+        }
+#else
+        if (!params.tts_postfilter.empty()) {
+            fprintf(stderr, "crispasr: --tts-postfilter: build was configured with -DCRISPASR_DFN=OFF\n");
+            return 17;
+        }
+#endif
+
+        // Write output WAV (post-filter native rate when on, else backend-native, mono)
         std::string out_path = params.tts_output.empty() ? "tts_output.wav" : params.tts_output;
         FILE* fout = fopen(out_path.c_str(), "wb");
         if (!fout) {
             fprintf(stderr, "crispasr: error: cannot write '%s'\n", out_path.c_str());
             return 16;
         }
-        int32_t sr = sr_in;
+        int32_t sr = sr_out;
         int16_t channels = 1;
         int16_t bits = 16;
         int32_t data_size = (int32_t)audio.size() * 2;
@@ -1399,7 +1481,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
         if (!params.no_prints)
             fprintf(stderr, "crispasr: TTS output written to '%s' (%zu samples @ %d Hz, %.2f sec)\n", out_path.c_str(),
-                    audio.size(), sr_in, (double)audio.size() / (double)sr_in);
+                    audio.size(), sr_out, (double)audio.size() / (double)sr_out);
         return 0;
     }
 

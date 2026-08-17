@@ -28,6 +28,10 @@
 #if defined(CRISPASR_RNNOISE)
 #include "crispasr_enhance.h" // RNNoise audio enhancement (shared with CLI)
 #endif
+#if defined(CRISPASR_DFN)
+#include "dfn.h"            // DeepFilterNet3 streaming post-filter for TTS
+#include "audio_resample.h" // miniaudio polyphase resampler wrapper (24↔48 kHz)
+#endif
 #include "text_lid_dispatch.h"       // Text-LID backend-agnostic façade (CLD3 + fastText)
 #include "crispasr_aligner.h"        // CTC / forced-aligner word timings (shared with CLI)
 #include "crispasr_cache.h"          // HF download + filesystem cache (shared with CLI)
@@ -1279,6 +1283,19 @@ struct crispasr_session {
 #ifdef CA_HAVE_MIMO_ASR
     mimo_asr_context* mimo_asr_ctx = nullptr;
 #endif
+
+#ifdef CRISPASR_DFN
+    // Optional DeepFilterNet3 post-filter applied to TTS audio (see
+    // crispasr_session_set_tts_postfilter). When `dfn_postfilter` is
+    // non-null, the session's TTS streaming path swaps in a trampoline
+    // that upsamples the engine's native 24 kHz output to 48 kHz, runs
+    // DFN, and hands the user callback 48 kHz mono float32. Owned by
+    // the session; the per-stream `dfn_stream` and resampler live on
+    // `crispasr_tts_stream`.
+    struct dfn_model* dfn_postfilter   = nullptr;
+    std::string       dfn_postfilter_model_path;
+    bool              dfn_postfilter_enabled = false;
+#endif
 };
 
 struct crispasr_session_seg {
@@ -1459,10 +1476,8 @@ static std::vector<crispasr_session_seg::word> emit_words_from_tokens(const std:
             // emitted word. Whisper tokens are sub-word (BPE-ish), so
             // for a multi-token word like "kubectl" → ["kub","ect","l"]
             // we surface alternatives of "kub" only. That's the
-            // discriminating token in practice — if the user sees
-            // "cubicle" as an alt for "kub", they know the model
-            // wavered there. Full word-level enumeration would require
-            // expanding a token-tree per word; out of scope for v1.
+            // discriminating token in practice — full word-level enumeration
+            // would require expanding a token-tree per word; out of scope for v1.
             cur.alts = tk.alts;
             have_cur = true;
         }
@@ -1474,6 +1489,22 @@ static std::vector<crispasr_session_seg::word> emit_words_from_tokens(const std:
     if (have_cur)
         flush();
     return out;
+}
+
+CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_path, const char* backend_name,
+                                                           int n_threads);
+
+// Explicit-backend open with a GPU on/off override (sets the thread-local
+// use_gpu used by backend init for the duration of the open). Lets callers
+// force CPU — e.g. to compare against a CPU-only engine without a GPU-vs-CPU
+// confound. Restores the previous default afterward.
+CA_EXPORT crispasr_session* crispasr_session_open_explicit_gpu(const char* model_path, const char* backend_name,
+                                                               int n_threads, int use_gpu) {
+    const bool prev = g_open_use_gpu_tls;
+    g_open_use_gpu_tls = (use_gpu != 0);
+    crispasr_session* s = crispasr_session_open_explicit(model_path, backend_name, n_threads);
+    g_open_use_gpu_tls = prev;
+    return s;
 }
 
 CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_path, const char* backend_name,
@@ -4640,8 +4671,306 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
     return nullptr;
 }
 
+// =========================================================================
+// Streaming TTS — push text incrementally, receive PCM chunks via callback
+// =========================================================================
+// Mirrors the chat streaming API (crispasr_chat_generate_stream). For the
+// vibevoice backend (VibeVoice-Realtime-0.5B) this drives true incremental
+// synthesis on a worker thread: audio is emitted as soon as each speech window
+// is decoded. For all other TTS backends it buffers the pushed text and runs a
+// single synthesize() at stream end, emitting the result as one final chunk —
+// so the API works uniformly regardless of backend. The PCM passed to the
+// callback is 24 kHz mono f32, valid only for the duration of the callback.
+typedef void (*crispasr_tts_on_audio)(const float* pcm, int n_samples, void* user);
+
+struct crispasr_tts_stream {
+    crispasr_session* s = nullptr;
+    crispasr_tts_on_audio cb = nullptr;
+    void* user = nullptr;
+#ifdef CA_HAVE_VIBEVOICE
+    vibevoice_tts_stream* vv = nullptr; // non-null when delegating to vibevoice
+#endif
+    std::string buffered; // accumulates text for the buffer-then-synthesize path
+
+#ifdef CRISPASR_DFN
+    // Per-stream post-filter state. Non-null when the session has the
+    // DFN post-filter enabled (`crispasr_session_set_tts_postfilter`).
+    // The vibevoice worker thread emits 24 kHz mono f32 chunks into
+    // `pf_trampoline`, which: (1) resamples them to 48 kHz via `pf_resampler`,
+    // (2) feeds dfn_stream_process, (3) calls the user's `cb` with the
+    // 48 kHz output. Created on `crispasr_session_tts_stream_begin`,
+    // torn down on `_free`.
+    struct dfn_stream*      pf_dfn       = nullptr;
+    struct audio_resampler* pf_resampler = nullptr;
+    int                     pf_in_rate   = 0; // engine native sample rate (24000 today)
+    int                     pf_out_rate  = 0; // DFN native rate (48000)
+    // Scratch buffers for the trampoline. Sized big enough for the
+    // largest plausible engine emit + 2× headroom for the upsample.
+    std::vector<float>      pf_scratch_up;     // upsampled @ 48 kHz
+    std::vector<float>      pf_scratch_dfn;    // dfn output @ 48 kHz
+#endif
+};
+
+#ifdef CRISPASR_DFN
+// Trampoline installed in place of the user's callback when the
+// post-filter is on. Runs on the vibevoice worker thread.
+static void crispasr_tts_postfilter_emit(const float* pcm, int n_samples, void* user) {
+    auto* st = static_cast<crispasr_tts_stream*>(user);
+    if (!st || !pcm || n_samples <= 0)
+        return;
+
+    // 1) Upsample the engine chunk to 48 kHz (stateful resampler keeps
+    //    fractional remainders across calls). Worst-case expansion is
+    //    out_rate/in_rate × n_in samples plus a small slack from the
+    //    resampler's internal buffer.
+    const size_t up_cap = (size_t)((int64_t)n_samples * st->pf_out_rate / st->pf_in_rate) + 64;
+    if (st->pf_scratch_up.size() < up_cap)
+        st->pf_scratch_up.resize(up_cap);
+
+    int in_used = 0, out_written = 0;
+    if (audio_resampler_process(st->pf_resampler, pcm, n_samples, st->pf_scratch_up.data(), (int)up_cap, &in_used,
+                                &out_written) != 0) {
+        return;
+    }
+
+    // 2) Push through DFN. DFN can produce up to `out_written` samples
+    //    per call once the lookahead window has been filled. The
+    //    passthrough stub matches this; the real graph will respect the
+    //    same bound.
+    if (st->pf_scratch_dfn.size() < (size_t)out_written)
+        st->pf_scratch_dfn.resize(out_written);
+
+    int produced = 0;
+    if (dfn_stream_process(st->pf_dfn, st->pf_scratch_up.data(), out_written, st->pf_scratch_dfn.data(), out_written,
+                           &produced, /*final_chunk=*/false) != 0) {
+        return;
+    }
+
+    // 3) Emit at 48 kHz mono f32. May be zero samples while the
+    //    lookahead window is still filling — that's fine, the user
+    //    callback contract already permits empty chunks.
+    if (produced > 0 && st->cb)
+        st->cb(st->pf_scratch_dfn.data(), produced, st->user);
+}
+
+static void crispasr_tts_postfilter_flush(crispasr_tts_stream* st) {
+    if (!st || !st->pf_dfn)
+        return;
+    // Drain any samples the resampler still holds and the DFN lookahead
+    // buffer at end-of-stream. Loop until both report empty so the
+    // synthesised tail isn't truncated.
+    for (int guard = 0; guard < 16; ++guard) {
+        int in_used = 0, out_written = 0;
+        if (st->pf_scratch_up.size() < 1024)
+            st->pf_scratch_up.resize(1024);
+        if (audio_resampler_process(st->pf_resampler, nullptr, 0, st->pf_scratch_up.data(),
+                                    (int)st->pf_scratch_up.size(), &in_used, &out_written) != 0)
+            break;
+        if (st->pf_scratch_dfn.size() < (size_t)out_written + 2048)
+            st->pf_scratch_dfn.resize(out_written + 2048);
+        int produced = 0;
+        if (dfn_stream_process(st->pf_dfn, st->pf_scratch_up.data(), out_written, st->pf_scratch_dfn.data(),
+                               (int)st->pf_scratch_dfn.size(), &produced, /*final_chunk=*/true) != 0)
+            break;
+        if (produced > 0 && st->cb)
+            st->cb(st->pf_scratch_dfn.data(), produced, st->user);
+        if (out_written == 0 && produced == 0)
+            break;
+    }
+}
+#endif
+
+CA_EXPORT struct crispasr_tts_stream* crispasr_session_tts_stream_begin(crispasr_session* s, crispasr_tts_on_audio cb,
+                                                                        void* user) {
+    if (!s || !cb)
+        return nullptr;
+    auto* st = new crispasr_tts_stream();
+    st->s = s;
+    st->cb = cb;
+    st->user = user;
+
+#ifdef CRISPASR_DFN
+    // Bring up the per-stream post-filter pipeline if the session has
+    // it enabled and the model loaded. Failures here fall back to the
+    // raw 24 kHz path so a missing GGUF doesn't kill TTS entirely.
+    const int engine_rate = 24000; // vibevoice realtime — the only consumer wired in today
+    if (s->dfn_postfilter_enabled && s->dfn_postfilter) {
+        st->pf_dfn       = dfn_stream_create(s->dfn_postfilter);
+        st->pf_resampler = audio_resampler_create(engine_rate, dfn_model_sample_rate(s->dfn_postfilter),
+                                                  /*channels=*/1, /*algo=*/1);
+        st->pf_in_rate   = engine_rate;
+        st->pf_out_rate  = dfn_model_sample_rate(s->dfn_postfilter);
+        if (!st->pf_dfn || !st->pf_resampler) {
+            if (st->pf_dfn) dfn_stream_free(st->pf_dfn);
+            if (st->pf_resampler) audio_resampler_free(st->pf_resampler);
+            st->pf_dfn = nullptr;
+            st->pf_resampler = nullptr;
+        }
+    }
+#endif
+
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->vibevoice_ctx) {
+#ifdef CRISPASR_DFN
+        if (st->pf_dfn) {
+            // Install the trampoline as vibevoice's emit callback;
+            // user's `cb` is invoked from inside it at 48 kHz.
+            st->vv = vibevoice_tts_stream_begin(
+                s->vibevoice_ctx, reinterpret_cast<vibevoice_on_audio>(&crispasr_tts_postfilter_emit),
+                /*user=*/st);
+        } else
+#endif
+        {
+            // crispasr_tts_on_audio and vibevoice_on_audio are ABI-identical.
+            st->vv = vibevoice_tts_stream_begin(s->vibevoice_ctx, reinterpret_cast<vibevoice_on_audio>(cb), user);
+        }
+        if (!st->vv) {
+#ifdef CRISPASR_DFN
+            if (st->pf_dfn) dfn_stream_free(st->pf_dfn);
+            if (st->pf_resampler) audio_resampler_free(st->pf_resampler);
+#endif
+            delete st;
+            return nullptr;
+        }
+    }
+#endif
+    return st;
+}
+
+CA_EXPORT int crispasr_tts_stream_push_text(struct crispasr_tts_stream* st, const char* utf8) {
+    if (!st || !utf8)
+        return -1;
+#ifdef CA_HAVE_VIBEVOICE
+    if (st->vv)
+        return vibevoice_tts_stream_push_text(st->vv, utf8);
+#endif
+    st->buffered += utf8;
+    return 0;
+}
+
+CA_EXPORT int crispasr_tts_stream_end(struct crispasr_tts_stream* st) {
+    if (!st)
+        return -1;
+#ifdef CA_HAVE_VIBEVOICE
+    if (st->vv) {
+        int rc = vibevoice_tts_stream_end(st->vv);
+#ifdef CRISPASR_DFN
+        // The vibevoice worker keeps running until _free joins it, but
+        // signalling end means no more audio will arrive from the
+        // engine after the worker drains its queue. We flush the
+        // post-filter tail in _free (after the worker joins) to make
+        // sure no engine-side samples are still in flight.
+#endif
+        return rc;
+    }
+#endif
+    // Fallback for non-streaming backends: synthesize the whole buffered text
+    // once (blocking on the caller thread) and emit it as a single chunk.
+    if (st->buffered.empty())
+        return 0;
+    int n = 0;
+    float* pcm = crispasr_session_synthesize(st->s, st->buffered.c_str(), &n);
+    st->buffered.clear();
+    if (!pcm)
+        return -1;
+    if (n > 0 && st->cb)
+        st->cb(pcm, n, st->user);
+    free(pcm); // crispasr_session_synthesize buffers are malloc'd (== crispasr_pcm_free)
+    return 0;
+}
+
+CA_EXPORT void crispasr_tts_stream_abort(struct crispasr_tts_stream* st) {
+    if (!st)
+        return;
+#ifdef CA_HAVE_VIBEVOICE
+    if (st->vv)
+        vibevoice_tts_stream_abort(st->vv); // stop generating ASAP; free() joins quickly
+#endif
+}
+
+CA_EXPORT void crispasr_tts_stream_free(struct crispasr_tts_stream* st) {
+    if (!st)
+        return;
+#ifdef CA_HAVE_VIBEVOICE
+    if (st->vv)
+        vibevoice_tts_stream_free(st->vv); // signals end + joins worker
+#endif
+#ifdef CRISPASR_DFN
+    // Worker is joined now; flush whatever's still in the resampler /
+    // DFN lookahead so the listener gets the full utterance tail.
+    if (st->pf_dfn)
+        crispasr_tts_postfilter_flush(st);
+    if (st->pf_dfn) dfn_stream_free(st->pf_dfn);
+    if (st->pf_resampler) audio_resampler_free(st->pf_resampler);
+#endif
+    delete st;
+}
+
 CA_EXPORT void crispasr_pcm_free(float* pcm) {
     free(pcm);
+}
+
+// =========================================================================
+// DeepFilterNet3 post-filter for TTS audio (PLAN: flickering-greeting-backus).
+// =========================================================================
+//
+// VibeVoice realtime occasionally hallucinates background music when an
+// utterance opens with phrases like "Hello there"; DFN3 cleans those up
+// and, as a side-effect, pushes the output rate from 24 kHz → 48 kHz.
+//
+// Wired at the session layer so any TTS engine routed through
+// `crispasr_session_tts_stream_*` can use it. Disabled by default.
+// When enabled, the user's `crispasr_tts_on_audio` callback receives
+// 48 kHz mono float32 (query the current rate with
+// `crispasr_session_get_tts_output_sample_rate`).
+
+CA_EXPORT int crispasr_session_set_tts_postfilter(struct crispasr_session* s, int enabled,
+                                                  const char* dfn_gguf_path) {
+    if (!s)
+        return -1;
+#ifdef CRISPASR_DFN
+    if (!enabled) {
+        if (s->dfn_postfilter) {
+            dfn_model_free(s->dfn_postfilter);
+            s->dfn_postfilter = nullptr;
+        }
+        s->dfn_postfilter_enabled = false;
+        s->dfn_postfilter_model_path.clear();
+        return 0;
+    }
+    // Lazy-load (or re-load if the path changed).
+    if (!s->dfn_postfilter || s->dfn_postfilter_model_path != (dfn_gguf_path ? dfn_gguf_path : "")) {
+        if (s->dfn_postfilter) {
+            dfn_model_free(s->dfn_postfilter);
+            s->dfn_postfilter = nullptr;
+        }
+        if (!dfn_gguf_path || !*dfn_gguf_path)
+            return -2; // enabling without a model path is meaningless
+        dfn_params p = dfn_default_params();
+        s->dfn_postfilter = dfn_model_load(dfn_gguf_path, p);
+        if (!s->dfn_postfilter)
+            return -3;
+        s->dfn_postfilter_model_path = dfn_gguf_path;
+    }
+    s->dfn_postfilter_enabled = true;
+    return 0;
+#else
+    (void)enabled;
+    (void)dfn_gguf_path;
+    return -2; // built without CRISPASR_DFN
+#endif
+}
+
+CA_EXPORT int crispasr_session_get_tts_output_sample_rate(const struct crispasr_session* s) {
+    if (!s)
+        return -1;
+#ifdef CRISPASR_DFN
+    if (s->dfn_postfilter_enabled && s->dfn_postfilter)
+        return dfn_model_sample_rate(s->dfn_postfilter);
+#endif
+    // Native VibeVoice realtime emit rate. Other engines that join the
+    // session TTS surface will need a per-backend rate lookup here.
+    return 24000;
 }
 
 // =========================================================================
@@ -4670,6 +4999,18 @@ CA_EXPORT char* crispasr_session_translate_text(crispasr_session* s, const char*
 // to release a single malloc'd buffer.  No-op when `text` is nullptr.
 CA_EXPORT void crispasr_session_translate_text_free(char* text) {
     free(text);
+}
+
+// Quiet the ggml/Metal log flood (kernel-pipeline compiles, device init, etc.)
+// by routing logs through a WARN+ filter — INFO/DEBUG are dropped, warnings and
+// errors still reach stderr. Call once before opening a session. Note: this is
+// process-global (ggml has one log callback).
+static void ca_log_warn_plus(ggml_log_level level, const char* text, void* /*user*/) {
+    if (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN)
+        fputs(text, stderr);
+}
+CA_EXPORT void crispasr_log_silence(void) {
+    whisper_log_set(ca_log_warn_plus, nullptr);
 }
 
 // =========================================================================
@@ -4848,6 +5189,12 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_KOKORO
     if (s->kokoro_ctx)
         kokoro_free(s->kokoro_ctx);
+#endif
+#ifdef CRISPASR_DFN
+    if (s->dfn_postfilter) {
+        dfn_model_free(s->dfn_postfilter);
+        s->dfn_postfilter = nullptr;
+    }
 #endif
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx)
@@ -5233,6 +5580,43 @@ CA_EXPORT int crispasr_session_set_cfg_weight(crispasr_session* s, float cfg_wei
 #ifdef CA_HAVE_CHATTERBOX
     if (s->chatterbox_ctx) {
         chatterbox_set_cfg_weight((chatterbox_context*)s->chatterbox_ctx, cfg_weight);
+        touched++;
+    }
+#endif
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->vibevoice_ctx) {
+        // VibeVoice's classifier-free-guidance scale (the analogue of
+        // chatterbox's cfg_weight). Read on every synthesize call.
+        vibevoice_set_cfg_scale((vibevoice_context*)s->vibevoice_ctx, cfg_weight);
+        touched++;
+    }
+#endif
+    return touched > 0 ? 0 : -2;
+}
+
+// Set VibeVoice's speech VAE scaling/bias factors (latent = raw/scale - bias).
+// Overrides both the GGUF tensor and the 0.196 / -0.049 defaults. Pass NaN to
+// clear the override.
+CA_EXPORT int crispasr_session_set_speech_scaling_factor(crispasr_session* s, float factor) {
+    if (!s)
+        return -1;
+    int touched = 0;
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->vibevoice_ctx) {
+        vibevoice_set_speech_scaling_factor((vibevoice_context*)s->vibevoice_ctx, factor);
+        touched++;
+    }
+#endif
+    return touched > 0 ? 0 : -2;
+}
+
+CA_EXPORT int crispasr_session_set_speech_bias_factor(crispasr_session* s, float factor) {
+    if (!s)
+        return -1;
+    int touched = 0;
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->vibevoice_ctx) {
+        vibevoice_set_speech_bias_factor((vibevoice_context*)s->vibevoice_ctx, factor);
         touched++;
     }
 #endif

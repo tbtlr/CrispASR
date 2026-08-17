@@ -592,6 +592,8 @@ CRISPASR_API int crispasr_session_set_top_p(struct crispasr_session* s, float to
 CRISPASR_API int crispasr_session_set_min_p(struct crispasr_session* s, float min_p);
 CRISPASR_API int crispasr_session_set_repetition_penalty(struct crispasr_session* s, float r);
 CRISPASR_API int crispasr_session_set_cfg_weight(struct crispasr_session* s, float cfg_weight);
+CRISPASR_API int crispasr_session_set_speech_scaling_factor(struct crispasr_session* s, float factor);
+CRISPASR_API int crispasr_session_set_speech_bias_factor(struct crispasr_session* s, float factor);
 CRISPASR_API int crispasr_session_set_exaggeration(struct crispasr_session* s, float exaggeration);
 CRISPASR_API int crispasr_session_set_max_speech_tokens(struct crispasr_session* s, int n);
 CRISPASR_API int crispasr_session_set_length_scale(struct crispasr_session* s, float scale);
@@ -607,6 +609,31 @@ CRISPASR_API int crispasr_session_set_whisper_decode_extras(struct crispasr_sess
                                                              const char* suppress_regex,
                                                              int carry_initial_prompt);
 CRISPASR_API int crispasr_session_set_ask(struct crispasr_session* s, const char* prompt);
+
+// Enable / disable the DeepFilterNet3 post-filter on TTS audio.
+// When enabled, the callback installed by
+// `crispasr_session_tts_stream_begin` receives 48 kHz mono float32
+// instead of the engine-native rate; background-music artefacts that
+// VibeVoice realtime occasionally hallucinates on phrases like
+// "Hello there" are scrubbed out. Disabled by default.
+//
+//   enabled       — 0 to disable (releases the model), non-zero to enable.
+//   dfn_gguf_path — path to the GGUF produced by
+//                   `models/convert-deepfilternet-to-gguf.py`. Required
+//                   when enabling; ignored when disabling. May be NULL.
+//
+// Return codes:
+//    0 success
+//   -1 invalid session
+//   -2 feature unavailable (build was configured -DCRISPASR_DFN=OFF, or
+//      `enabled` was non-zero with no model path)
+//   -3 GGUF failed to load (bad path / wrong architecture)
+CRISPASR_API int crispasr_session_set_tts_postfilter(struct crispasr_session* s, int enabled,
+                                                      const char* dfn_gguf_path);
+
+// Current TTS callback sample rate. 24000 when the post-filter is off
+// (VibeVoice native), 48000 when it is on. Returns -1 for a null session.
+CRISPASR_API int crispasr_session_get_tts_output_sample_rate(const struct crispasr_session* s);
 
 // Run the entire model: PCM -> log mel spectrogram -> encoder -> decoder -> text
 // Not thread safe for same context

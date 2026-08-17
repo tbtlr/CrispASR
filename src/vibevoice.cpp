@@ -137,6 +137,7 @@ extern "C" struct vibevoice_context_params vibevoice_context_default_params(void
     p.speech_scaling_factor = NAN; // unset → GGUF tensor, else 0.196
     p.speech_bias_factor = NAN;    // unset → GGUF tensor, else -0.049
     p.neg_condition_anchor = NAN;  // unset → 0.2 (mirrors misc/vibevoice)
+    p.stream_first_chunk_frames = 0; // unset → built-in default (6 frames)
     return p;
 }
 
@@ -4309,7 +4310,12 @@ static float* vibevoice_realtime_run(struct vibevoice_context* ctx, const char* 
     // producing the next (steady-state generation is several× real time), keeping
     // playback gap-free without a startup buffer.
     const int kEmitChunkFramesMax = 32; // ~4.3 s cap — amortizes the receptive-field decode
+    // First chunk size is overridable (ctx params) because it is the dominant
+    // term in time-to-first-audio; see vibevoice.h.
     int emit_chunk = 6;                 // ~0.8 s first chunk; doubles after each emit
+    if (ctx->params.stream_first_chunk_frames > 0) {
+        emit_chunk = std::min(ctx->params.stream_first_chunk_frames, kEmitChunkFramesMax);
+    }
     auto emit_ready = [&](bool final_chunk) -> bool {
         if (final_chunk)
             return true;
@@ -4537,6 +4543,18 @@ static float* vibevoice_realtime_run(struct vibevoice_context* ctx, const char* 
 
             if (append_audio_frame)
                 all_latents.insert(all_latents.end(), z.begin(), z.end());
+
+            // Streaming: test for an emit after EVERY frame, not only at the end
+            // of the text window below. The interleave produces ~6 speech frames
+            // per window, so checking only after the loop means the first chunk
+            // can never be smaller than 6 frames — which silently pins
+            // time-to-first-audio and makes stream_first_chunk_frames inert.
+            // The sigma-VAE decode is linear at ~26 ms/frame, so those 6 frames
+            // are ~160 ms of decode sitting in front of the first sound.
+            if (streaming && append_audio_frame && emit_ready(/*final_chunk=*/false)) {
+                emit_window(/*final_chunk=*/false);
+                emit_chunk = std::min(kEmitChunkFramesMax, emit_chunk * 2);
+            }
             if (fi == 0) {
                 vibevoice_dump_f32(dump_dir, "tts_latent_frame0", z.data(), z.size());
             }

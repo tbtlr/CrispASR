@@ -41,6 +41,17 @@ struct vibevoice_context_params {
     // behaviour, drifts), 1 = fixed anchor only, 0.2 = misc/vibevoice's
     // default (live * 0.8 + anchor * 0.2). NaN = use that 0.2 default too.
     float neg_condition_anchor;
+    // Size of the FIRST streaming audio chunk, in latent frames (~133 ms each);
+    // subsequent chunks double up to an internal cap. This is the dominant term
+    // in time-to-first-audio: the callback cannot fire until a whole first
+    // chunk has been generated, so 6 frames (~0.8 s) costs ~370 ms of latency
+    // before any sound at ~2x realtime synthesis.
+    //
+    // Lower is faster to speak but leaves less buffered audio to cover
+    // generating the next chunk, and each emit re-decodes a fixed overlap
+    // through the sigma-VAE — so the overhead does not shrink with the chunk.
+    // Too low and playback underruns. 0 = keep the built-in default (6).
+    int stream_first_chunk_frames;
 };
 
 struct vibevoice_context_params vibevoice_context_default_params(void);

@@ -25,6 +25,22 @@ struct vibevoice_context_params {
     uint32_t seed;   // RNG seed for TTS diffusion noise (0 = env/default)
     bool flash_attn; // PLAN #89 plumbing — σ-VAE encoder + Qwen2.5
                      // talker SA blocks.
+    // Diffusion overrides. NaN = "unset": keep the built-in behaviour (CFG scale
+    // auto-selected by model type; scaling/bias from the GGUF tensors, else the
+    // 0.196 / -0.049 defaults). A non-NaN value overrides — and for scaling/bias
+    // takes precedence over the GGUF tensors.
+    float cfg_scale;             // classifier-free-guidance scale (>0)
+    float speech_scaling_factor; // VAE latent scale (>0; latent = raw/scale - bias)
+    float speech_bias_factor;    // VAE latent bias
+    // CFG negative-condition anchor blend. The realtime model's negative-path
+    // hidden state evolves with each speech frame, so the "reference" the CFG
+    // pushes away from drifts as a reply gets long — audible as the voice
+    // gradually losing energy / getting calmer. Blending in a fixed snapshot
+    // (taken right after the initial IMAGE_PAD prefill) stabilises the
+    // reference. Range [0, 1]: 0 = live negative path only (original
+    // behaviour, drifts), 1 = fixed anchor only, 0.2 = misc/vibevoice's
+    // default (live * 0.8 + anchor * 0.2). NaN = use that 0.2 default too.
+    float neg_condition_anchor;
 };
 
 struct vibevoice_context_params vibevoice_context_default_params(void);
@@ -40,6 +56,14 @@ void vibevoice_free(struct vibevoice_context* ctx);
 // burning latency for inaudible quality gain.
 void vibevoice_set_tts_steps(struct vibevoice_context* ctx, int steps);
 void vibevoice_set_seed(struct vibevoice_context* ctx, uint32_t seed);
+
+// Runtime setters for the diffusion overrides above. Like tts_steps these are
+// read on every synthesize call, so post-init mutation affects the next call.
+// Pass NaN to clear an override and restore the built-in behaviour.
+void vibevoice_set_cfg_scale(struct vibevoice_context* ctx, float cfg_scale);
+void vibevoice_set_speech_scaling_factor(struct vibevoice_context* ctx, float factor);
+void vibevoice_set_speech_bias_factor(struct vibevoice_context* ctx, float factor);
+void vibevoice_set_neg_condition_anchor(struct vibevoice_context* ctx, float anchor);
 
 // Transcribe raw 24kHz mono PCM audio.
 // Returns malloc'd UTF-8 string, caller frees with free().
@@ -98,6 +122,30 @@ float* vibevoice_synthesize(struct vibevoice_context* ctx, const char* text, int
 // Load a voice prompt GGUF for TTS. Returns 0 on success.
 // The voice prompt pre-fills KV caches with speaker identity.
 int vibevoice_load_voice(struct vibevoice_context* ctx, const char* voice_path);
+
+// ── Streaming TTS (VibeVoice-Realtime-0.5B) ──────────────────────────────────
+// Push text incrementally and receive 24 kHz mono PCM chunks as they are
+// synthesized, instead of waiting for the whole utterance. Requires a loaded
+// voice prompt (vibevoice_load_voice). Generation runs on an internal worker
+// thread; `on_audio` is invoked from that thread for each decoded chunk (the
+// `pcm` pointer is valid only for the duration of the call — copy it).
+struct vibevoice_tts_stream;
+typedef void (*vibevoice_on_audio)(const float* pcm, int n_samples, void* user);
+
+// Begin a streaming TTS session. Spawns the worker thread (which blocks waiting
+// for the first text). Returns NULL on failure.
+struct vibevoice_tts_stream* vibevoice_tts_stream_begin(struct vibevoice_context* ctx, vibevoice_on_audio on_audio,
+                                                        void* user);
+// Append UTF-8 text to vocalize. Non-blocking. Returns 0 on success.
+int vibevoice_tts_stream_push_text(struct vibevoice_tts_stream* st, const char* utf8);
+// Signal end-of-text: no more push_text calls. The worker drains remaining text,
+// emits trailing audio, then finishes. Non-blocking. Returns 0 on success.
+int vibevoice_tts_stream_end(struct vibevoice_tts_stream* st);
+// Abort generation ASAP (user interrupt / shutdown). The worker stops emitting
+// further audio; free() then joins quickly instead of synthesizing the rest.
+void vibevoice_tts_stream_abort(struct vibevoice_tts_stream* st);
+// Signal end (if not already), join the worker thread, and release the session.
+void vibevoice_tts_stream_free(struct vibevoice_tts_stream* st);
 
 #ifdef __cplusplus
 }

@@ -28,12 +28,17 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 // ===========================================================================
@@ -109,6 +114,10 @@ struct vibevoice_context {
     ggml_cgraph* pred_graph = nullptr;
     int pred_graph_n_frames = 0;
     std::vector<uint8_t> pred_graph_meta;
+    // Streaming VAE decodes are bounded (stream_decode_context frames), so the
+    // per-window decoder graph is small — safe to run on Metal/GPU, unlike the
+    // batch path's single full-length decode that the CPU fallback guards.
+    bool vae_streaming_gpu = false;
 };
 
 // ===========================================================================
@@ -124,6 +133,10 @@ extern "C" struct vibevoice_context_params vibevoice_context_default_params(void
     p.tts_steps = 20;
     p.seed = 0;
     p.flash_attn = true;
+    p.cfg_scale = NAN;             // unset → auto by model type
+    p.speech_scaling_factor = NAN; // unset → GGUF tensor, else 0.196
+    p.speech_bias_factor = NAN;    // unset → GGUF tensor, else -0.049
+    p.neg_condition_anchor = NAN;  // unset → 0.2 (mirrors misc/vibevoice)
     return p;
 }
 
@@ -133,6 +146,15 @@ extern "C" struct vibevoice_context_params vibevoice_context_default_params(void
 
 extern "C" struct vibevoice_context* vibevoice_init_from_file(const char* path_model,
                                                               struct vibevoice_context_params params) {
+    // When the caller asks for silence (verbosity == 0), install a no-op log
+    // callback on OUR ggml fork so its backend-init / pipeline-cache /
+    // pipeline-compile chatter doesn't leak to the consumer's stderr. We
+    // can't reach the consumer's own ggml from here, so this only affects
+    // the copy of ggml linked into libcrispasr.
+    if (params.verbosity == 0) {
+        ggml_log_set([](ggml_log_level, const char *, void *) {}, nullptr);
+    }
+
     auto* ctx = new vibevoice_context();
     ctx->params = params;
     auto& m = ctx->model;
@@ -292,6 +314,28 @@ extern "C" void vibevoice_set_tts_steps(struct vibevoice_context* ctx, int steps
 extern "C" void vibevoice_set_seed(struct vibevoice_context* ctx, uint32_t seed) {
     if (ctx)
         ctx->params.seed = seed;
+}
+
+// Diffusion overrides. Read on every synthesize call (see the realtime/base
+// paths). NaN restores the built-in behaviour; a finite value overrides it.
+extern "C" void vibevoice_set_cfg_scale(struct vibevoice_context* ctx, float cfg_scale) {
+    if (ctx)
+        ctx->params.cfg_scale = cfg_scale;
+}
+
+extern "C" void vibevoice_set_speech_scaling_factor(struct vibevoice_context* ctx, float factor) {
+    if (ctx)
+        ctx->params.speech_scaling_factor = factor;
+}
+
+extern "C" void vibevoice_set_speech_bias_factor(struct vibevoice_context* ctx, float factor) {
+    if (ctx)
+        ctx->params.speech_bias_factor = factor;
+}
+
+extern "C" void vibevoice_set_neg_condition_anchor(struct vibevoice_context* ctx, float anchor) {
+    if (ctx)
+        ctx->params.neg_condition_anchor = anchor;
 }
 
 extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
@@ -2216,6 +2260,44 @@ static ggml_cgraph* build_vae_decoder_graph(vibevoice_context* ctx, int n_frames
     return gf;
 }
 
+// ── σ-VAE decode of a contiguous latent range ──────────────────────────────
+// Decodes `n_frames` already-scaled acoustic latents (layout [vae_dim, n_frames],
+// i.e. scaled = raw/scaling_factor - bias_factor applied by the caller) into
+// 24 kHz mono PCM. Returns the raw decoder output (no trim/fade); empty on
+// failure. Used by both the all-at-once path (one call) and the streaming path
+// (one call per emitted window, with left-context overlap). The CPU-force block
+// matches the inline decode in vibevoice_synthesize (Metal watchdog / Vulkan
+// workgroup-count workarounds) — smaller per-window graphs are also far less
+// likely to trip those limits.
+static std::vector<float> vibevoice_vae_decode_range(vibevoice_context* ctx, const float* scaled_latent, int n_frames) {
+    if (!ctx || !scaled_latent || n_frames <= 0)
+        return {};
+    int vae_dim = ctx->model.hp.vae_dim_acoustic;
+    size_t total_latent = (size_t)n_frames * vae_dim;
+
+    ggml_cgraph* dec_gf = build_vae_decoder_graph(ctx, n_frames);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ctx->vae_streaming_gpu && vibevoice_vae_should_use_cpu(ctx->backend, ctx->backend_cpu)) {
+        for (int i = 0; i < ggml_graph_n_nodes(dec_gf); i++)
+            ggml_backend_sched_set_tensor_backend(ctx->sched, ggml_graph_node(dec_gf, i), ctx->backend_cpu);
+    }
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, dec_gf)) {
+        fprintf(stderr, "vibevoice TTS: decoder graph alloc failed\n");
+        return {};
+    }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(dec_gf, "dec_latent"), scaled_latent, 0,
+                            total_latent * sizeof(float));
+    if (ggml_backend_sched_graph_compute(ctx->sched, dec_gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "vibevoice TTS: decoder compute failed\n");
+        return {};
+    }
+    ggml_tensor* audio_out = ggml_graph_get_tensor(dec_gf, "dec_audio");
+    int total_audio = (int)audio_out->ne[0] * (int)audio_out->ne[1];
+    std::vector<float> raw((size_t)total_audio);
+    ggml_backend_tensor_get(audio_out, raw.data(), 0, (size_t)total_audio * sizeof(float));
+    return raw;
+}
+
 // ── LM hidden state extraction (no KV cache) ───────────────────────────────
 
 // Run text through Qwen2 LM, return hidden states.
@@ -2500,6 +2582,26 @@ extern "C" int vibevoice_load_voice(struct vibevoice_context* ctx, const char* v
 
 // ── vibevoice_synthesize ────────────────────────────────────────────────────
 
+// Control hooks for streaming realtime synthesis. Both members are invoked
+// from vibevoice_realtime_run on the worker thread that drives generation.
+struct vibevoice_stream_ctl {
+    // Pull up to `max_tokens` more text token-ids to vocalize; append them to
+    // `out`. Set *eof=true once the producer has signalled end-of-text and no
+    // more tokens will arrive. May block until text is available or EOF.
+    // Return false only on hard error.
+    std::function<bool(int max_tokens, std::vector<int32_t>& out, bool* eof)> pull_text;
+    // Emit one decoded 24 kHz mono PCM chunk. `final_chunk` marks the last one.
+    std::function<void(const float* pcm, int n_samples, bool final_chunk)> emit_audio;
+    // Optional: return true to stop generation early (e.g. user interrupted /
+    // shutdown). Checked once per speech frame. Null = never abort.
+    std::function<bool()> should_abort;
+};
+
+// Realtime-0.5B path (definition below vibevoice_synthesize). Batch mode when
+// ctl == null; streaming mode when ctl != null (text == null in that case).
+static float* vibevoice_realtime_run(struct vibevoice_context* ctx, const char* text,
+                                     struct vibevoice_stream_ctl* ctl, int* out_n_samples);
+
 extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char* text, int* out_n_samples) {
     if (!ctx || !text || !text[0])
         return nullptr;
@@ -2529,7 +2631,6 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     int vae_dim = hp.vae_dim_acoustic;
     int d_lm = hp.d_lm;
     const char* dump_dir = getenv("VIBEVOICE_TTS_DUMP");
-    const auto tts_t0 = std::chrono::high_resolution_clock::now();
 
     // VibeVoice TTS hits Apple's GPU watchdog
     // (kIOGPUCommandBufferCallbackErrorImpactingInteractivity) on Metal
@@ -2643,6 +2744,10 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                         ggml_backend_tensor_get(tsf, &sf, 0, sizeof(float));
                     if (tbf)
                         ggml_backend_tensor_get(tbf, &bf, 0, sizeof(float));
+                    if (!std::isnan(ctx->params.speech_scaling_factor))
+                        sf = ctx->params.speech_scaling_factor;
+                    if (!std::isnan(ctx->params.speech_bias_factor))
+                        bf = ctx->params.speech_bias_factor;
 
                     // 1. Acoustic encoder → scale → acoustic connector
                     int T_at = 0, vd_at = 0;
@@ -2961,6 +3066,10 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                 ggml_backend_tensor_get(sf, &scaling_factor, 0, sizeof(float));
             if (bf)
                 ggml_backend_tensor_get(bf, &bias_factor, 0, sizeof(float));
+            if (!std::isnan(ctx->params.speech_scaling_factor))
+                scaling_factor = ctx->params.speech_scaling_factor;
+            if (!std::isnan(ctx->params.speech_bias_factor))
+                bias_factor = ctx->params.speech_bias_factor;
         }
 
         std::vector<float> all_latents;
@@ -3004,8 +3113,10 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                 std::vector<float> prev_x0(vae_dim, 0.0f);
                 fill_gaussian_noise(z.data(), vae_dim, rng);
 
-                // Use the VibeVoice-API default CFG scale
+                // Use the VibeVoice-API default CFG scale (caller may override).
                 float base_cfg_scale = 1.3f;
+                if (!std::isnan(ctx->params.cfg_scale))
+                    base_cfg_scale = ctx->params.cfg_scale;
 
                 for (int si = 0; si < 20; si++) {
                     float t = (float)sched.timesteps[si];
@@ -3159,6 +3270,35 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         return out_buf;
     }
 
+    // Realtime-0.5B path lives in vibevoice_realtime_run so the streaming API
+    // (vibevoice_tts_stream_*) can drive it incrementally via a control struct.
+    return vibevoice_realtime_run(ctx, text, /*ctl=*/nullptr, out_n_samples);
+}
+
+// ── Realtime-0.5B TTS Path ──────────────────────────────────────────────────
+// Batch mode (ctl == null): `text` is the full utterance; returns malloc'd
+// trimmed+faded 24 kHz mono PCM (caller frees) with *out_n_samples set.
+// Streaming mode (ctl != null, text == null): text token-ids are pulled from
+// ctl->pull_text and audio is emitted incrementally via ctl->emit_audio; returns
+// a non-null sentinel on success, null on failure. Streaming requires voice mode.
+static float* vibevoice_realtime_run(struct vibevoice_context* ctx, const char* text,
+                                     struct vibevoice_stream_ctl* ctl, int* out_n_samples) {
+    auto& m = ctx->model;
+    auto& hp = m.hp;
+    auto G = [&](const std::string& name) -> ggml_tensor* {
+        auto it = m.tensors.find(name);
+        return it != m.tensors.end() ? it->second : nullptr;
+    };
+    const bool streaming = (ctl != nullptr);
+    int verbosity = ctx->params.verbosity;
+    int vae_dim = hp.vae_dim_acoustic;
+    int d_lm = hp.d_lm;
+    const char* dump_dir = getenv("VIBEVOICE_TTS_DUMP");
+    const auto tts_t0 = std::chrono::high_resolution_clock::now();
+    const bool is_base_model = false; // this function only handles the Realtime path
+    std::string text_with_nl = text ? (std::string(text) + "\n") : std::string();
+    std::vector<int32_t> text_ids = text ? tokenize_text_greedy(m, text_with_nl.c_str()) : std::vector<int32_t>();
+
     // ── Realtime-0.5B Streaming Model TTS Path (below) ──
     vibevoice_dump_i32(dump_dir, "tts_token_ids", text_ids.data(), text_ids.size());
 
@@ -3179,7 +3319,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     prompt.push_back(IM_START);
     prompt.push_back(872); // user
     prompt.push_back(198); // \n
-    std::string user_msg = std::string("Please read the following text aloud: ") + text;
+    std::string user_msg = std::string("Please read the following text aloud: ") + (text ? text : "");
     auto user_tokens = tokenize_text_greedy(m, user_msg.c_str());
     prompt.insert(prompt.end(), user_tokens.begin(), user_tokens.end());
     prompt.push_back(IM_END);
@@ -3194,6 +3334,37 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     // With voice prompt loaded: skip the template, use only text tokens as input
     // The voice KV cache already contains the system/chat context
     bool has_voice = ctx->voice.tts_seq_len > 0;
+
+    // Streaming requires voice mode (incremental text intake relies on the voice
+    // KV providing the system/chat context; the no-voice path splices the whole
+    // text into one chat-template prefill, which is incompatible with streaming).
+    bool text_eof = !streaming; // batch: text_ids already holds the whole utterance
+    if (streaming && !has_voice) {
+        fprintf(stderr, "vibevoice TTS: streaming requires a loaded voice prompt (set_voice)\n");
+        return nullptr;
+    }
+    // Streaming: block for the first text window so the prompt/prefill below has
+    // tokens to work with. Subsequent windows are pulled inside the interleave loop.
+    if (streaming) {
+        while ((int)text_ids.size() < 5 && !text_eof) {
+            std::vector<int32_t> more;
+            bool eof = false;
+            if (!ctl->pull_text(5 - (int)text_ids.size(), more, &eof)) {
+                text_eof = true;
+                break;
+            }
+            text_ids.insert(text_ids.end(), more.begin(), more.end());
+            if (eof)
+                text_eof = true;
+        }
+        if (text_ids.empty()) {
+            // Nothing to vocalize (empty utterance) — emit nothing, succeed.
+            if (out_n_samples)
+                *out_n_samples = 0;
+            return reinterpret_cast<float*>(ctx); // non-null streaming success sentinel
+        }
+    }
+
     if (has_voice) {
         // Process text in windows of TTS_TEXT_WINDOW_SIZE=5 (matching official pipeline)
         int tts_text_window = 5;
@@ -3211,6 +3382,250 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         fprintf(stderr, "vibevoice TTS: prompt %d tokens, using %s (%d layers)\n", prefix_len,
                 has_tts_lm ? "TTS LM" : "base LM", lm_n_layers);
     }
+
+    // ── Incremental base-LM over user text (voice mode) ─────────────────────────
+    // In voice mode the realtime model runs its 4-layer base LM over the user text
+    // with the voice.lm KV as left-context, then splices those hidden states into
+    // the TTS-LM input (process_text_window). Batch mode runs this once over all
+    // text; streaming mode extends it window-by-window as text arrives. The base
+    // KV cache is allocated once and kept alive for the whole call.
+    std::vector<float> all_base_hidden;      // base-LM hidden for text tokens [0, base_n_text_done)
+    int base_n_text_done = 0;                // text tokens already pushed through the base LM
+    ggml_backend_buffer_t base_kv_buf = nullptr;
+    ggml_context* base_kv_ctx = nullptr;
+    ggml_tensor* base_kv_k = nullptr;
+    ggml_tensor* base_kv_v = nullptr;
+    int base_kv_max_ctx = 0;
+    const int base_n_layers = hp.n_lm_layers;     // 4 for Realtime
+    const int base_vsl = ctx->voice.lm_seq_len;   // voice base-LM context length (e.g. 74)
+    // RAII: free the base KV cache on any return path.
+    struct BaseKvGuard {
+        ggml_backend_buffer_t* buf;
+        ggml_context** c;
+        ~BaseKvGuard() {
+            if (*buf)
+                ggml_backend_buffer_free(*buf);
+            if (*c)
+                ggml_free(*c);
+        }
+    } base_kv_guard{&base_kv_buf, &base_kv_ctx};
+
+    // Allocate the base KV cache for up to `cap_text` text tokens and prefill the
+    // voice.lm K/V into positions [0, base_vsl). Idempotent; no-op once allocated
+    // with enough capacity.
+    auto ensure_base_kv = [&](int cap_text) -> bool {
+        // Both paths now run the base LM in 5-token windows, so the first call
+        // only knows about the first window. Size the cache for the whole turn up
+        // front (growth-with-copy is unsupported): streaming uses the per-turn
+        // frame cap as headroom; batch knows the full text length already.
+        int want_text = cap_text;
+        if (streaming) {
+            int smf = 1024;
+            if (const char* mf = getenv("VIBEVOICE_STREAM_MAX_FRAMES"))
+                smf = std::max(12, atoi(mf));
+            want_text = std::max(cap_text, smf);
+        } else {
+            want_text = std::max(cap_text, (int)text_ids.size());
+        }
+        int want = base_vsl + want_text + 16;
+        if (base_kv_buf && want <= base_kv_max_ctx)
+            return true;
+        if (base_kv_buf) {
+            // Growing mid-stream is unsupported (would drop already-cached text K/V);
+            // size generously up front so this never trips.
+            fprintf(stderr, "vibevoice TTS: base KV capacity exceeded (%d > %d)\n", want, base_kv_max_ctx);
+            return false;
+        }
+        base_kv_max_ctx = want;
+        size_t base_k_size =
+            (size_t)ggml_type_size(GGML_TYPE_F16) * hp.head_dim * base_kv_max_ctx * hp.n_kv_heads * base_n_layers;
+        ggml_init_params bkp = {2 * ggml_tensor_overhead(), nullptr, true};
+        base_kv_ctx = ggml_init(bkp);
+        base_kv_k = ggml_new_tensor_4d(base_kv_ctx, GGML_TYPE_F16, hp.head_dim, base_kv_max_ctx, hp.n_kv_heads,
+                                       base_n_layers);
+        base_kv_v = ggml_new_tensor_4d(base_kv_ctx, GGML_TYPE_F16, hp.head_dim, base_kv_max_ctx, hp.n_kv_heads,
+                                       base_n_layers);
+        base_kv_buf = ggml_backend_alloc_buffer(ctx->backend, 2 * base_k_size);
+        uint8_t* base_ptr = (uint8_t*)ggml_backend_buffer_get_base(base_kv_buf);
+        ggml_backend_tensor_alloc(base_kv_buf, base_kv_k, base_ptr);
+        ggml_backend_tensor_alloc(base_kv_buf, base_kv_v, base_ptr + base_k_size);
+        ggml_backend_buffer_clear(base_kv_buf, 0);
+        // Pre-fill voice.lm K/V into positions [0, base_vsl).
+        size_t el_size = ggml_type_size(GGML_TYPE_F16);
+        for (int il = 0; il < base_n_layers; il++) {
+            for (int kv_type = 0; kv_type < 2; kv_type++) {
+                char vname[128];
+                snprintf(vname, sizeof(vname), "voice.lm.%d.%s", il, kv_type == 0 ? "k" : "v");
+                auto it = ctx->voice.tensors.find(vname);
+                if (it == ctx->voice.tensors.end())
+                    continue;
+                ggml_tensor* src = it->second;
+                ggml_tensor* dst = (kv_type == 0) ? base_kv_k : base_kv_v;
+                size_t head_src_bytes = (size_t)hp.head_dim * base_vsl * el_size;
+                size_t head_dst_stride = (size_t)hp.head_dim * base_kv_max_ctx * el_size;
+                size_t src_bytes = ggml_nbytes(src);
+                std::vector<uint8_t> tmp(src_bytes);
+                ggml_backend_tensor_get(src, tmp.data(), 0, src_bytes);
+                size_t layer_off = (size_t)il * dst->nb[3];
+                for (int ih = 0; ih < hp.n_kv_heads; ih++) {
+                    ggml_backend_tensor_set(dst, tmp.data() + (size_t)ih * head_src_bytes,
+                                            layer_off + (size_t)ih * head_dst_stride, head_src_bytes);
+                }
+            }
+        }
+        return true;
+    };
+
+    // Run the 4-layer base LM on `n_new` text tokens at positions
+    // [base_vsl + base_n_text_done, ...), append their hidden states to
+    // all_base_hidden, and advance base_n_text_done. Equivalent (via KV caching)
+    // to the original all-at-once forward over the full text.
+    auto run_base_lm_window = [&](const int32_t* toks, int n_new) -> bool {
+        if (n_new <= 0)
+            return true;
+        if (!ensure_base_kv(base_n_text_done + n_new))
+            return false;
+        int past = base_vsl + base_n_text_done;
+        int Lk = past + n_new;
+        auto base_embeds = run_token_embedding_lookup(ctx, toks, n_new);
+        if ((int)base_embeds.size() != n_new * d_lm)
+            return false;
+        size_t mem = ctx->compute_meta.size();
+        ggml_init_params ip_b = {mem, ctx->compute_meta.data(), true};
+        ggml_context* ctx_b = ggml_init(ip_b);
+        ggml_cgraph* gf_b = ggml_new_graph_custom(ctx_b, 65536, false);
+
+        ggml_tensor* emb_t = ggml_new_tensor_2d(ctx_b, GGML_TYPE_F32, d_lm, n_new);
+        ggml_set_name(emb_t, "base_in");
+        ggml_set_input(emb_t);
+        ggml_tensor* positions = ggml_new_tensor_1d(ctx_b, GGML_TYPE_I32, n_new);
+        ggml_set_name(positions, "base_pos");
+        ggml_set_input(positions);
+        ggml_tensor* causal_mask = ggml_new_tensor_2d(ctx_b, GGML_TYPE_F16, Lk, n_new);
+        ggml_set_name(causal_mask, "base_mask");
+        ggml_set_input(causal_mask);
+
+        ggml_tensor* cur = emb_t;
+        for (int il = 0; il < base_n_layers; il++) {
+            char p[64];
+            snprintf(p, sizeof(p), "lm.layers.%d", il);
+            ggml_tensor* residual = cur;
+            cur = ggml_rms_norm(ctx_b, cur, 1e-6f);
+            cur = ggml_mul(ctx_b, cur, G(std::string(p) + ".attn_ln.weight"));
+            {
+                ggml_tensor* Q = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.q_proj.weight"), cur);
+                auto* qb = G(std::string(p) + ".attn.q_proj.bias");
+                if (qb)
+                    Q = ggml_add(ctx_b, Q, qb);
+                ggml_tensor* K = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.k_proj.weight"), cur);
+                auto* kb = G(std::string(p) + ".attn.k_proj.bias");
+                if (kb)
+                    K = ggml_add(ctx_b, K, kb);
+                ggml_tensor* V = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.v_proj.weight"), cur);
+                auto* vb = G(std::string(p) + ".attn.v_proj.bias");
+                if (vb)
+                    V = ggml_add(ctx_b, V, vb);
+                Q = ggml_reshape_3d(ctx_b, Q, hp.head_dim, hp.n_heads, n_new);
+                K = ggml_reshape_3d(ctx_b, K, hp.head_dim, hp.n_kv_heads, n_new);
+                V = ggml_reshape_3d(ctx_b, V, hp.head_dim, hp.n_kv_heads, n_new);
+                Q = ggml_rope_ext(ctx_b, Q, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0, hp.rope_theta,
+                                  1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                K = ggml_rope_ext(ctx_b, K, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0, hp.rope_theta,
+                                  1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                ggml_tensor* K_perm = ggml_permute(ctx_b, K, 0, 2, 1, 3);
+                ggml_tensor* V_perm = ggml_permute(ctx_b, V, 0, 2, 1, 3);
+                ggml_tensor* k_view = ggml_view_4d(ctx_b, base_kv_k, hp.head_dim, n_new, hp.n_kv_heads, 1,
+                                                   base_kv_k->nb[1], base_kv_k->nb[2], base_kv_k->nb[3],
+                                                   (size_t)il * base_kv_k->nb[3] + (size_t)past * base_kv_k->nb[1]);
+                ggml_tensor* v_view = ggml_view_4d(ctx_b, base_kv_v, hp.head_dim, n_new, hp.n_kv_heads, 1,
+                                                   base_kv_v->nb[1], base_kv_v->nb[2], base_kv_v->nb[3],
+                                                   (size_t)il * base_kv_v->nb[3] + (size_t)past * base_kv_v->nb[1]);
+                ggml_build_forward_expand(gf_b, ggml_cpy(ctx_b, K_perm, k_view));
+                ggml_build_forward_expand(gf_b, ggml_cpy(ctx_b, V_perm, v_view));
+                ggml_tensor* Kf = ggml_cont(ctx_b, ggml_view_3d(ctx_b, base_kv_k, hp.head_dim, Lk, hp.n_kv_heads,
+                                                                base_kv_k->nb[1], base_kv_k->nb[2],
+                                                                (size_t)il * base_kv_k->nb[3]));
+                ggml_tensor* Vf = ggml_cont(ctx_b, ggml_view_3d(ctx_b, base_kv_v, hp.head_dim, Lk, hp.n_kv_heads,
+                                                                base_kv_v->nb[1], base_kv_v->nb[2],
+                                                                (size_t)il * base_kv_v->nb[3]));
+                Q = ggml_cont(ctx_b, ggml_permute(ctx_b, Q, 0, 2, 1, 3));
+                float scale = 1.0f / sqrtf((float)hp.head_dim);
+                ggml_tensor* attn = ggml_flash_attn_ext(ctx_b, Q, Kf, Vf, causal_mask, scale, 0.0f, 0.0f);
+                attn = ggml_reshape_2d(ctx_b, attn, d_lm, n_new);
+                attn = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.o_proj.weight"), attn);
+                cur = ggml_add(ctx_b, residual, attn);
+            }
+            residual = cur;
+            cur = ggml_rms_norm(ctx_b, cur, 1e-6f);
+            cur = ggml_mul(ctx_b, cur, G(std::string(p) + ".ffn_ln.weight"));
+            ggml_tensor* ffn = core_ffn::swiglu(ctx_b, cur, G(std::string(p) + ".ffn.gate.weight"),
+                                                G(std::string(p) + ".ffn.up.weight"), G(std::string(p) + ".ffn.down.weight"));
+            cur = ggml_add(ctx_b, residual, ffn);
+        }
+        // Realtime base LM has no final norm.
+        ggml_set_name(cur, "base_out");
+        ggml_set_output(cur);
+        ggml_build_forward_expand(gf_b, cur);
+
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf_b))
+            return false;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_in"), base_embeds.data(), 0,
+                                base_embeds.size() * sizeof(float));
+        std::vector<int32_t> bpos(n_new);
+        for (int i = 0; i < n_new; i++)
+            bpos[i] = past + i;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_pos"), bpos.data(), 0, bpos.size() * sizeof(int32_t));
+        std::vector<ggml_fp16_t> bmask((size_t)n_new * Lk, ggml_fp32_to_fp16(0.0f));
+        ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        for (int q = 0; q < n_new; q++)
+            for (int k = past + q + 1; k < Lk; k++)
+                bmask[(size_t)q * Lk + k] = neg_inf;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_mask"), bmask.data(), 0,
+                                bmask.size() * sizeof(ggml_fp16_t));
+        if (ggml_backend_sched_graph_compute(ctx->sched, gf_b) != GGML_STATUS_SUCCESS)
+            return false;
+        size_t prev = all_base_hidden.size();
+        all_base_hidden.resize(prev + (size_t)n_new * d_lm);
+        ggml_backend_tensor_get(ggml_graph_get_tensor(gf_b, "base_out"), all_base_hidden.data() + prev, 0,
+                                (size_t)n_new * d_lm * sizeof(float));
+        base_n_text_done += n_new;
+        return true;
+    };
+
+    // Ensure at least `target_total` text tokens are tokenized (pulling more from
+    // the streaming producer if needed) AND that their base-LM hidden states are
+    // computed. Returns the number of text tokens now available; sets text_eof
+    // when the producer is exhausted. Batch mode never pulls (text_eof is true).
+    auto ensure_text = [&](int target_total) -> int {
+        while ((int)text_ids.size() < target_total && !text_eof) {
+            std::vector<int32_t> more;
+            bool eof = false;
+            if (!ctl->pull_text(target_total - (int)text_ids.size(), more, &eof)) {
+                text_eof = true;
+                break;
+            }
+            if (!more.empty())
+                text_ids.insert(text_ids.end(), more.begin(), more.end());
+            if (eof)
+                text_eof = true;
+            if (more.empty() && !eof)
+                break; // producer returned nothing without EOF — avoid busy-loop
+        }
+        // Run the base LM in fixed 5-token windows (TTS_TEXT_WINDOW_SIZE),
+        // matching the reference inference. Crucially, batch and streaming then
+        // execute IDENTICAL incremental base-LM calls — so the spliced
+        // conditioning (and thus the generated audio) is identical regardless of
+        // whether the full text was known up front. (Doing batch all-at-once and
+        // streaming windowed diverges numerically via the F16 KV cache, and AR
+        // generation amplifies that into audibly different pacing.)
+        while (has_voice && has_tts_lm && base_n_text_done < (int)text_ids.size()) {
+            int n = std::min(5, (int)text_ids.size() - base_n_text_done);
+            if (!run_base_lm_window(text_ids.data() + base_n_text_done, n))
+                break;
+        }
+        return (int)text_ids.size();
+    };
 
     // 2. Embed prompt tokens (use TTS LM's embedding if available)
     std::string emb_key = has_tts_lm ? "tts_lm.tok_emb.weight" : "lm.tok_emb.weight";
@@ -3251,8 +3666,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
 
     // Extract type embeddings (text=1, speech=0) into reusable vectors
     std::vector<float> text_type_emb(d_lm, 0.0f);
-
-    std::vector<float> all_base_hidden; // base LM hidden states for ALL text tokens (voice mode)
+    // all_base_hidden / run_base_lm_window / ensure_text are declared above.
 
     // 2b. If TTS LM: add type embeddings FIRST, then splice base LM hidden
     //     (matching reference: embed → type_embed → splice overwrites type at text positions)
@@ -3310,188 +3724,41 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                 }
             }
         } else {
-            // With voice: run base LM on text tokens WITH voice.lm KV cache.
-            // The official pipeline: forward_lm(text_tokens) with voice.lm KV (74 tokens context)
-            // We build a temporary KV cache for the 4-layer base LM, pre-fill from voice.lm,
-            // then run the base LM transformer with positions starting at voice.lm.seq_len.
-
-            int base_n_layers = hp.n_lm_layers;   // 4 for Realtime model
-            int base_vsl = ctx->voice.lm_seq_len; // 74
-            int n_text = (int)text_ids.size();    // process ALL text tokens at once
-
-            // Allocate temporary base LM KV cache
-            int base_max_ctx = base_vsl + n_text + 16;
-            size_t base_k_size =
-                (size_t)ggml_type_size(GGML_TYPE_F16) * hp.head_dim * base_max_ctx * hp.n_kv_heads * base_n_layers;
-            ggml_init_params bkp = {2 * ggml_tensor_overhead(), nullptr, true};
-            ggml_context* base_kv_ctx = ggml_init(bkp);
-            ggml_tensor* base_kv_k =
-                ggml_new_tensor_4d(base_kv_ctx, GGML_TYPE_F16, hp.head_dim, base_max_ctx, hp.n_kv_heads, base_n_layers);
-            ggml_tensor* base_kv_v =
-                ggml_new_tensor_4d(base_kv_ctx, GGML_TYPE_F16, hp.head_dim, base_max_ctx, hp.n_kv_heads, base_n_layers);
-            ggml_backend_buffer_t base_kv_buf = ggml_backend_alloc_buffer(ctx->backend, 2 * base_k_size);
-            uint8_t* base_ptr = (uint8_t*)ggml_backend_buffer_get_base(base_kv_buf);
-            ggml_backend_tensor_alloc(base_kv_buf, base_kv_k, base_ptr);
-            ggml_backend_tensor_alloc(base_kv_buf, base_kv_v, base_ptr + base_k_size);
-            ggml_backend_buffer_clear(base_kv_buf, 0);
-
-            // Pre-fill base LM KV from voice.lm
-            size_t el_size = ggml_type_size(GGML_TYPE_F16);
-            for (int il = 0; il < base_n_layers; il++) {
-                for (int kv_type = 0; kv_type < 2; kv_type++) {
-                    char vname[128];
-                    snprintf(vname, sizeof(vname), "voice.lm.%d.%s", il, kv_type == 0 ? "k" : "v");
-                    auto it = ctx->voice.tensors.find(vname);
-                    if (it == ctx->voice.tensors.end())
-                        continue;
-                    ggml_tensor* src = it->second;
-                    ggml_tensor* dst = (kv_type == 0) ? base_kv_k : base_kv_v;
-                    size_t head_src_bytes = (size_t)hp.head_dim * base_vsl * el_size;
-                    size_t head_dst_stride = (size_t)hp.head_dim * base_max_ctx * el_size;
-                    size_t src_bytes = ggml_nbytes(src);
-                    std::vector<uint8_t> tmp(src_bytes);
-                    ggml_backend_tensor_get(src, tmp.data(), 0, src_bytes);
-                    size_t layer_off = (size_t)il * dst->nb[3];
-                    for (int ih = 0; ih < hp.n_kv_heads; ih++) {
-                        ggml_backend_tensor_set(dst, tmp.data() + (size_t)ih * head_src_bytes,
-                                                layer_off + (size_t)ih * head_dst_stride, head_src_bytes);
-                    }
-                }
-            }
-
-            // Run base LM (4 layers) on text tokens with KV cache
-            // Build graph using base LM weights ("lm." prefix) with the temp KV cache
-            auto base_embeds = run_token_embedding_lookup(ctx, text_ids.data(), n_text);
-            if ((int)base_embeds.size() == n_text * d_lm) {
-                // Build and run base LM graph with temp KV cache
-                size_t mem = ctx->compute_meta.size();
-                ggml_init_params ip_b = {mem, ctx->compute_meta.data(), true};
-                ggml_context* ctx_b = ggml_init(ip_b);
-                ggml_cgraph* gf_b = ggml_new_graph_custom(ctx_b, 65536, false);
-
-                ggml_tensor* emb_t = ggml_new_tensor_2d(ctx_b, GGML_TYPE_F32, d_lm, n_text);
-                ggml_set_name(emb_t, "base_in");
-                ggml_set_input(emb_t);
-                ggml_tensor* positions = ggml_new_tensor_1d(ctx_b, GGML_TYPE_I32, n_text);
-                ggml_set_name(positions, "base_pos");
-                ggml_set_input(positions);
-                ggml_tensor* causal_mask = ggml_new_tensor_2d(ctx_b, GGML_TYPE_F16, base_vsl + n_text, n_text);
-                ggml_set_name(causal_mask, "base_mask");
-                ggml_set_input(causal_mask);
-
-                ggml_tensor* cur = emb_t;
-                for (int il = 0; il < base_n_layers; il++) {
-                    char p[64];
-                    snprintf(p, sizeof(p), "lm.layers.%d", il);
-                    ggml_tensor* residual = cur;
-                    cur = ggml_rms_norm(ctx_b, cur, 1e-6f);
-                    cur = ggml_mul(ctx_b, cur, G(std::string(p) + ".attn_ln.weight"));
-                    {
-                        int Lk = base_vsl + n_text;
-                        ggml_tensor* Q = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.q_proj.weight"), cur);
-                        auto* qb = G(std::string(p) + ".attn.q_proj.bias");
-                        if (qb)
-                            Q = ggml_add(ctx_b, Q, qb);
-                        ggml_tensor* K = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.k_proj.weight"), cur);
-                        auto* kb = G(std::string(p) + ".attn.k_proj.bias");
-                        if (kb)
-                            K = ggml_add(ctx_b, K, kb);
-                        ggml_tensor* V = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.v_proj.weight"), cur);
-                        auto* vb = G(std::string(p) + ".attn.v_proj.bias");
-                        if (vb)
-                            V = ggml_add(ctx_b, V, vb);
-                        Q = ggml_reshape_3d(ctx_b, Q, hp.head_dim, hp.n_heads, n_text);
-                        K = ggml_reshape_3d(ctx_b, K, hp.head_dim, hp.n_kv_heads, n_text);
-                        V = ggml_reshape_3d(ctx_b, V, hp.head_dim, hp.n_kv_heads, n_text);
-                        Q = ggml_rope_ext(ctx_b, Q, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                                          hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-                        K = ggml_rope_ext(ctx_b, K, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX, 0,
-                                          hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-                        // Write K, V to temp base KV cache
-                        ggml_tensor* K_perm = ggml_permute(ctx_b, K, 0, 2, 1, 3);
-                        ggml_tensor* V_perm = ggml_permute(ctx_b, V, 0, 2, 1, 3);
-                        ggml_tensor* k_view = ggml_view_4d(
-                            ctx_b, base_kv_k, hp.head_dim, n_text, hp.n_kv_heads, 1, base_kv_k->nb[1], base_kv_k->nb[2],
-                            base_kv_k->nb[3], (size_t)il * base_kv_k->nb[3] + (size_t)base_vsl * base_kv_k->nb[1]);
-                        ggml_tensor* v_view = ggml_view_4d(
-                            ctx_b, base_kv_v, hp.head_dim, n_text, hp.n_kv_heads, 1, base_kv_v->nb[1], base_kv_v->nb[2],
-                            base_kv_v->nb[3], (size_t)il * base_kv_v->nb[3] + (size_t)base_vsl * base_kv_v->nb[1]);
-                        ggml_build_forward_expand(gf_b, ggml_cpy(ctx_b, K_perm, k_view));
-                        ggml_build_forward_expand(gf_b, ggml_cpy(ctx_b, V_perm, v_view));
-                        // Read full KV
-                        ggml_tensor* Kf = ggml_cont(
-                            ctx_b, ggml_view_3d(ctx_b, base_kv_k, hp.head_dim, Lk, hp.n_kv_heads, base_kv_k->nb[1],
-                                                base_kv_k->nb[2], (size_t)il * base_kv_k->nb[3]));
-                        ggml_tensor* Vf = ggml_cont(
-                            ctx_b, ggml_view_3d(ctx_b, base_kv_v, hp.head_dim, Lk, hp.n_kv_heads, base_kv_v->nb[1],
-                                                base_kv_v->nb[2], (size_t)il * base_kv_v->nb[3]));
-                        Q = ggml_cont(ctx_b, ggml_permute(ctx_b, Q, 0, 2, 1, 3));
-                        float scale = 1.0f / sqrtf((float)hp.head_dim);
-                        ggml_tensor* attn = ggml_flash_attn_ext(ctx_b, Q, Kf, Vf, causal_mask, scale, 0.0f, 0.0f);
-                        attn = ggml_reshape_2d(ctx_b, attn, d_lm, n_text);
-                        attn = ggml_mul_mat(ctx_b, G(std::string(p) + ".attn.o_proj.weight"), attn);
-                        cur = ggml_add(ctx_b, residual, attn);
-                    }
-                    residual = cur;
-                    cur = ggml_rms_norm(ctx_b, cur, 1e-6f);
-                    cur = ggml_mul(ctx_b, cur, G(std::string(p) + ".ffn_ln.weight"));
-                    ggml_tensor* ffn =
-                        core_ffn::swiglu(ctx_b, cur, G(std::string(p) + ".ffn.gate.weight"),
-                                         G(std::string(p) + ".ffn.up.weight"), G(std::string(p) + ".ffn.down.weight"));
-                    cur = ggml_add(ctx_b, residual, ffn);
-                }
-                // No final norm for Realtime base LM (only 4 layers, no lm.norm.weight)
-                ggml_set_name(cur, "base_out");
-                ggml_set_output(cur);
-                ggml_build_forward_expand(gf_b, cur);
-
-                ggml_backend_sched_reset(ctx->sched);
-                if (ggml_backend_sched_alloc_graph(ctx->sched, gf_b)) {
-                    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_in"), base_embeds.data(), 0,
-                                            base_embeds.size() * sizeof(float));
-                    std::vector<int32_t> bpos(n_text);
-                    for (int i = 0; i < n_text; i++)
-                        bpos[i] = base_vsl + i;
-                    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_pos"), bpos.data(), 0,
-                                            bpos.size() * sizeof(int32_t));
-                    // Causal mask: can attend to all voice positions + past text positions
-                    int Lk = base_vsl + n_text;
-                    std::vector<ggml_fp16_t> bmask((size_t)n_text * Lk, ggml_fp32_to_fp16(0.0f));
-                    ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
-                    for (int q = 0; q < n_text; q++)
-                        for (int k = base_vsl + q + 1; k < Lk; k++)
-                            bmask[(size_t)q * Lk + k] = neg_inf;
-                    ggml_backend_tensor_set(ggml_graph_get_tensor(gf_b, "base_mask"), bmask.data(), 0,
-                                            bmask.size() * sizeof(ggml_fp16_t));
-
-                    if (ggml_backend_sched_graph_compute(ctx->sched, gf_b) == GGML_STATUS_SUCCESS) {
-                        std::vector<float> base_hidden(n_text * d_lm);
-                        ggml_backend_tensor_get(ggml_graph_get_tensor(gf_b, "base_out"), base_hidden.data(), 0,
-                                                base_hidden.size() * sizeof(float));
-                        // Store ALL base hidden for use by process_text_window
-                        all_base_hidden = base_hidden;
-                        vibevoice_dump_f32(dump_dir, "tts_base_lm_hidden_voice", base_hidden.data(),
-                                           base_hidden.size());
-                        if (verbosity >= 1)
-                            fprintf(stderr,
-                                    "  base LM with voice KV (%d layers, %d ctx): replaced %d text embeddings + type\n",
-                                    base_n_layers, base_vsl, n_text);
-                    }
-                }
-            }
-
-            // Clean up temp base LM KV
-            ggml_backend_buffer_free(base_kv_buf);
-            ggml_free(base_kv_ctx);
+            // With voice: run the 4-layer base LM over the user text with the
+            // voice.lm KV as left-context, populating all_base_hidden for
+            // process_text_window. Batch mode fills it once over the whole
+            // utterance here; streaming mode extends it as text arrives. The
+            // KV-cached run_base_lm_window is equivalent to the original
+            // all-at-once forward (defined above, near has_tts_lm).
+            ensure_text((int)text_ids.size());
         }
     }
 
     // 3. Allocate KV cache for autoregressive generation
-    // Max frames: generous upper bound; EOS classifier will stop early
-    int n_frames = std::max(12, (int)(text_ids.size() * 4.0f));
-    n_frames = std::min(n_frames, 300);
+    // Max frames: generous upper bound; EOS classifier will stop early.
+    // Streaming: text length is not known up front, so cap frames (and reserve
+    // text headroom) to a configurable per-turn bound and size the KV cache for
+    // voice + text-cap + frames-cap. The interleave runs ~6 speech : 5 text, so
+    // frames_cap headroom for text is frames_cap*5/6, rounded up generously.
+    int stream_max_frames = 1024;
+    if (const char* mf = getenv("VIBEVOICE_STREAM_MAX_FRAMES"))
+        stream_max_frames = std::max(12, atoi(mf));
+    int stream_text_cap = stream_max_frames; // headroom; 6:5 interleave keeps text < frames
+    int n_frames;
     int voice_ctx = ctx->voice.tts_seq_len; // 0 if no voice loaded
-    int max_ctx = voice_ctx + prefix_len + n_frames + 16;
+    int max_ctx;
+    if (streaming) {
+        n_frames = stream_max_frames;
+        max_ctx = voice_ctx + stream_text_cap + n_frames + 16;
+    } else {
+        n_frames = std::max(12, (int)(text_ids.size() * 4.0f));
+        n_frames = std::min(n_frames, 300);
+        // Size for the full sequence: voice + prefill/text + speech frames. The
+        // prefill is prefix_len (no-voice: whole chat template incl. text) or the
+        // first text window (voice: 5, then all text_ids tokens are appended), so
+        // take the max of both to cover either path.
+        max_ctx = voice_ctx + std::max(prefix_len, (int)text_ids.size()) + n_frames + 16;
+    }
     int num_steps = ctx->params.tts_steps > 0 ? ctx->params.tts_steps : 20;
 
     const ggml_type tts_kv_type = GGML_TYPE_F32;
@@ -3802,7 +4069,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     //   3. neg_condition       = neg TTS LM forward(neg_prefill_input at pos 0, no past KV).last
     std::vector<float> neg_condition(d_lm, 0.0f);
     if (has_tts_lm) {
-        const int32_t IMAGE_PAD = 151655;
+            const int32_t IMAGE_PAD = 151655;
         int32_t pad_id = IMAGE_PAD;
         // 1. Run the negative base LM prefill (1 IMAGE_PAD token, no past KV, no final norm).
         //    Realtime base LM has no final norm — pass has_final_norm=false. We do not need
@@ -3838,12 +4105,25 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         }
     }
 
+    // Snapshot the initial neg_condition. The CFG-use site below blends this
+    // with the live, evolving neg_condition so the negative reference doesn't
+    // drift over a long reply. Mirrors misc/vibevoice's neg_condition_anchor.
+    std::vector<float> neg_condition_init = neg_condition;
+
     // Process a text window: ONLY the positive path is advanced. The negative path is
     // never updated by text windows (matches the official inference loop in
     // modeling_vibevoice_streaming_inference.py).
     auto process_text_window = [&](int cursor, int win_len) -> bool {
         if (win_len <= 0)
             return true;
+        // Defensive: never read past the base-LM hidden states we actually
+        // computed (all_base_hidden holds base_n_text_done tokens). If a base-LM
+        // window failed, bail rather than splice garbage conditioning.
+        if (has_voice && cursor + win_len > base_n_text_done) {
+            fprintf(stderr, "vibevoice TTS: base hidden missing for [%d,%d) (have %d) — aborting\n", cursor,
+                    cursor + win_len, base_n_text_done);
+            return false;
+        }
 
         // Build input: base_hidden[cursor:cursor+win_len] + type_emb[1]
         std::vector<float> win_embeds((size_t)win_len * d_lm, 0.0f);
@@ -3871,7 +4151,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         int first_win = std::min((int)text_ids.size(), TEXT_WINDOW);
         if (verbosity >= 1)
             fprintf(stderr, "vibevoice TTS: text window 1: %d tokens, pos %d\n", first_win, n_past);
-        if (!process_text_window(0, first_win)) {
+            if (!process_text_window(0, first_win)) {
             fprintf(stderr, "vibevoice TTS: first text window failed\n");
             return nullptr;
         }
@@ -3909,6 +4189,11 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
             ggml_backend_tensor_get(sf, &scaling_factor, 0, sizeof(float));
         if (bf)
             ggml_backend_tensor_get(bf, &bias_factor, 0, sizeof(float));
+        // Caller override wins over both GGUF tensor and default.
+        if (!std::isnan(ctx->params.speech_scaling_factor))
+            scaling_factor = ctx->params.speech_scaling_factor;
+        if (!std::isnan(ctx->params.speech_bias_factor))
+            bias_factor = ctx->params.speech_bias_factor;
         if (verbosity >= 2 || getenv("VIBEVOICE_TTS_TRACE"))
             fprintf(stderr, "  speech_scaling=%g speech_bias=%g  (sf=%p bf=%p)\n", scaling_factor, bias_factor,
                     (void*)sf, (void*)bf);
@@ -3941,8 +4226,11 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         }
     }
 
-    // Use 1.3 for Base models (prevents static drift), 3.0 for Realtime models
+    // Use 1.3 for Base models (prevents static drift), 3.0 for Realtime models.
+    // A caller-supplied cfg_scale overrides the auto choice.
     float cfg_scale = is_base_model ? 1.3f : 3.0f;
+    if (!std::isnan(ctx->params.cfg_scale))
+        cfg_scale = ctx->params.cfg_scale;
 
     std::vector<float> all_latents;
     mt19937_state rng;
@@ -3979,11 +4267,142 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     double bench_sum_diff = 0, bench_sum_lm = 0;
     int bench_frames = 0;
 
+    // ── Streaming emit state ────────────────────────────────────────────────
+    // Decode newly-generated latents and emit them as soon as each speech window
+    // completes (low time-to-first-audio). The σ-VAE decoder is a deep CAUSAL
+    // conv stack whose receptive field spans many tens of latent frames (stage-0
+    // has ~8 ConvNeXt blocks at the full latent rate), so decoding a chunk with
+    // only a couple of context frames degrades quality badly. Because the stack
+    // is causal, decoding the prefix [0..total] gives output bit-identical to the
+    // batch decode for those frames — so we decode from frame 0 (full left
+    // context) and emit only the newly-valid tail. This matches batch quality
+    // exactly. Cost is O(N^2) decode over a turn; bound it for very long turns
+    // with VIBEVOICE_STREAM_DECODE_CONTEXT=<frames> (0 = full context, default).
+    // Bound the left-context re-decode to the σ-VAE decoder's receptive field. The
+    // decoder is causal, so frame f's output depends only on [f - R, f]; decoding
+    // with R frames of warmup gives output bit-identical to full-context for the
+    // emitted tail, while making each window's decode O(1) instead of O(total)
+    // (which was the O(N²) that pushed long replies past real time). R ≈ stem(K=7)
+    // + stage-0 ConvNeXt blocks (depths[0]≈8 × dw K=7) ≈ 54 latent frames at the
+    // latent rate; later stages run at ≥8× rate so contribute negligibly. 64 covers
+    // it with margin. 0 = full context (old behaviour).
+    int stream_decode_context = 64;
+    if (const char* dc = getenv("VIBEVOICE_STREAM_DECODE_CONTEXT"))
+        stream_decode_context = std::max(0, atoi(dc));
+    // A bounded context keeps each per-window decoder graph small, so it can run on
+    // the GPU instead of the slow Metal→CPU fallback. Honour an explicit
+    // VIBEVOICE_VAE_BACKEND=cpu override; only force GPU when the context is bounded.
+    {
+        const char* vae_env = getenv("VIBEVOICE_VAE_BACKEND");
+        ctx->vae_streaming_gpu =
+            streaming && stream_decode_context > 0 && !(vae_env && std::strcmp(vae_env, "cpu") == 0);
+    }
+    const int kDecoderWarmupSamples = 2400; // 100 ms @ 24 kHz, matches batch path
+    int frames_emitted = 0;
+    bool first_emit = true;
+
+    // Coalesce emits. Each emit re-decodes stream_decode_context (~R) frames of
+    // overlap through the σ-VAE, so emitting every 6-frame speech window decodes
+    // that big receptive-field context far too often. Ramp the chunk size: a small
+    // first chunk for low time-to-first-audio, then doubling up to a cap so the
+    // per-decode cost is amortized — and each chunk plays long enough to cover
+    // producing the next (steady-state generation is several× real time), keeping
+    // playback gap-free without a startup buffer.
+    const int kEmitChunkFramesMax = 32; // ~4.3 s cap — amortizes the receptive-field decode
+    int emit_chunk = 6;                 // ~0.8 s first chunk; doubles after each emit
+    auto emit_ready = [&](bool final_chunk) -> bool {
+        if (final_chunk)
+            return true;
+        int pending = (int)all_latents.size() / vae_dim - frames_emitted;
+        return pending >= emit_chunk;
+    };
+    auto emit_window = [&](bool final_chunk) {
+        if (!streaming)
+            return;
+
+        int total = (int)all_latents.size() / vae_dim;
+        if (total <= frames_emitted) {
+            if (final_chunk)
+                ctl->emit_audio(nullptr, 0, true); // signal end with no audio
+            return;
+        }
+        int ctx_start = (stream_decode_context > 0) ? std::max(0, frames_emitted - stream_decode_context) : 0;
+        int nf = total - ctx_start;
+        std::vector<float> scaled((size_t)nf * vae_dim);
+        for (size_t i = 0; i < (size_t)nf * vae_dim; i++)
+            scaled[i] = all_latents[(size_t)ctx_start * vae_dim + i] / scaling_factor - bias_factor;
+        std::vector<float> raw = vibevoice_vae_decode_range(ctx, scaled.data(), nf);
+        if (raw.empty()) {
+            if (final_chunk)
+                ctl->emit_audio(nullptr, 0, true);
+            return;
+        }
+        int hop = (int)(raw.size() / (size_t)nf); // samples per latent frame (≈3200)
+        int local_off = (frames_emitted - ctx_start) * hop;
+        if (first_emit)
+            local_off = std::max(local_off, std::min(kDecoderWarmupSamples, (int)raw.size()));
+        if (local_off > (int)raw.size())
+            local_off = (int)raw.size();
+        std::vector<float> out(raw.begin() + local_off, raw.end());
+        if (first_emit) {
+            int n_fi = std::min(480, (int)out.size()); // 20 ms quadratic fade-in
+            for (int i = 0; i < n_fi; i++) {
+                float t = (float)i / (float)n_fi;
+                out[i] *= t * t;
+            }
+        }
+        if (final_chunk) {
+            // Match the batch path's clean ending: trim trailing near-silence
+            // (last sample above tail_floor + ~50 ms margin), then 50 ms fade-out.
+            const float tail_floor = 0.01f;
+            const int tail_margin = 1200; // 50 ms @ 24 kHz
+            int trim_end = (int)out.size();
+            for (int i = (int)out.size() - 1; i >= 0; i--) {
+                if (fabsf(out[i]) > tail_floor) {
+                    trim_end = std::min((int)out.size(), i + tail_margin + 1);
+                    break;
+                }
+            }
+            if (trim_end > 0 && trim_end < (int)out.size())
+                out.resize(trim_end);
+            int n_fo = std::min(1200, (int)out.size()); // 50 ms linear fade-out
+            for (int i = 0; i < n_fo; i++) {
+                float t = (float)(n_fo - i) / (float)n_fo;
+                out[(int)out.size() - n_fo + i] *= t;
+            }
+        }
+        if (!out.empty())
+            ctl->emit_audio(out.data(), (int)out.size(), final_chunk);
+        else if (final_chunk)
+            ctl->emit_audio(nullptr, 0, true);
+        first_emit = false;
+        frames_emitted = total;
+    };
+
     while (!finished && total_frames < n_frames) {
+        // Early abort (user interrupt / shutdown): stop generating now.
+        if (streaming && ctl->should_abort && ctl->should_abort()) {
+            if (verbosity >= 1)
+                fprintf(stderr, "  vibevoice TTS (stream): aborted by caller\n");
+            break;
+        }
         // Generate SPEECH_WINDOW frames
         int frames_this_window = std::min(SPEECH_WINDOW, n_frames - total_frames);
 
         for (int si = 0; si < frames_this_window; si++) {
+            // Per-frame abort check (in addition to the per-window one above).
+            // Without this, an abort signal during a window waits up to one
+            // whole 6-frame window before being noticed (~200-400 ms of synth
+            // time). Per-frame checks bring max-abort-latency down to one
+            // frame's compute (~30-80 ms). Setting `finished` exits both the
+            // inner for and the outer while naturally.
+            if (streaming && ctl->should_abort && ctl->should_abort()) {
+                if (verbosity >= 1)
+                    fprintf(stderr, "  vibevoice TTS (stream): aborted (mid-window, frame %d)\n",
+                            total_frames + si);
+                finished = true;
+                break;
+            }
             int fi = total_frames + si;
             const bool append_audio_frame = !finished;
             auto t_frame_start = std::chrono::high_resolution_clock::now();
@@ -4032,10 +4451,30 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                                         vae_dim * 2 * sizeof(float));
                 ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pred_t_sin"), t_sin.data(), 0, 256 * sizeof(float));
 
-                // Conditions: [d_lm, 2] — positive then negative
+                // Conditions: [d_lm, 2] — positive then negative.
+                // Negative side is a blend of (live evolving neg_condition,
+                // initial-snapshot neg_condition_init) controlled by
+                // params.neg_condition_anchor in [0, 1] (NaN → 0.2 default).
+                // The blend is one-shot per diffusion step and does NOT modify
+                // the live state — next frame's run_lm_step still sees the
+                // unmodified neg_condition so it can evolve naturally.
+                float anchor_w = ctx->params.neg_condition_anchor;
+                if (std::isnan(anchor_w)) anchor_w = 0.2f;
+                if (anchor_w < 0.0f) anchor_w = 0.0f;
+                if (anchor_w > 1.0f) anchor_w = 1.0f;
                 std::vector<float> cond_pair((size_t)d_lm * 2);
                 memcpy(cond_pair.data(), hidden.data(), d_lm * sizeof(float));
-                memcpy(cond_pair.data() + d_lm, neg_condition.data(), d_lm * sizeof(float));
+                if (anchor_w == 0.0f) {
+                    memcpy(cond_pair.data() + d_lm, neg_condition.data(), d_lm * sizeof(float));
+                } else if (anchor_w == 1.0f) {
+                    memcpy(cond_pair.data() + d_lm, neg_condition_init.data(), d_lm * sizeof(float));
+                } else {
+                    const float w_live = 1.0f - anchor_w;
+                    for (int j = 0; j < d_lm; j++) {
+                        cond_pair[(size_t)d_lm + j] =
+                            neg_condition[j] * w_live + neg_condition_init[j] * anchor_w;
+                    }
+                }
                 ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pred_condition"), cond_pair.data(), 0,
                                         (size_t)d_lm * 2 * sizeof(float));
 
@@ -4216,6 +4655,22 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
 
         total_frames += frames_this_window;
 
+        // Streaming: emit once enough new frames have accumulated (coalesced to
+        // amortize the receptive-field re-decode); the first chunk emits early, then
+        // the chunk size ramps up to the cap.
+        if (emit_ready(/*final_chunk=*/false)) {
+            emit_window(/*final_chunk=*/false);
+            emit_chunk = std::min(kEmitChunkFramesMax, emit_chunk * 2);
+        }
+
+        // Streaming: pull the next text window before feeding it. ensure_text
+        // BLOCKS until more text arrives (pacing speech to text) or EOF, and
+        // extends all_base_hidden via the incremental base LM. Once the producer
+        // is exhausted (text_eof), this returns immediately and the loop keeps
+        // generating trailing speech frames until the EOS classifier fires.
+        if (!finished && streaming)
+            ensure_text(text_cursor + TEXT_WINDOW);
+
         // Process next text window (if any remaining)
         if (text_cursor < (int)text_ids.size() && !finished) {
             int next_win = std::min((int)text_ids.size() - text_cursor, TEXT_WINDOW);
@@ -4228,7 +4683,30 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
             }
             text_cursor += next_win;
         }
+
+        // Streaming: once all pushed text is vocalized and the producer is done,
+        // bound total generation by the SAME budget the batch path uses
+        // (text_len*4, capped at 300) so the model gets the same room to wind
+        // down naturally — EOS normally stops it first; this only guards the
+        // pathological no-EOS case (and matches batch's own worst-case bound).
+        if (streaming && text_eof && text_cursor >= (int)text_ids.size() && !finished) {
+            int batch_budget = std::min(300, std::max(12, (int)(text_ids.size() * 4.0f)));
+            if (total_frames >= batch_budget) {
+                if (verbosity >= 1)
+                    fprintf(stderr, "vibevoice TTS (stream): frame budget (%d) reached without EOS, stopping\n",
+                            batch_budget);
+                finished = true;
+            }
+        }
     } // end text/speech interleave loop
+
+    // Streaming: flush the final decoded chunk (with fade-out) and return.
+    if (streaming) {
+        emit_window(/*final_chunk=*/true);
+        if (verbosity >= 1)
+            fprintf(stderr, "vibevoice TTS (stream): emitted %d frames as audio\n", frames_emitted);
+        return reinterpret_cast<float*>(ctx); // non-null streaming success sentinel
+    }
 
     int total_latent = (int)all_latents.size();
     if (verbosity >= 1) {
@@ -4259,57 +4737,20 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         scaled_latent[i] = all_latents[i] / scaling_factor - bias_factor;
 
     auto t_vae_build0 = std::chrono::high_resolution_clock::now();
-    ggml_cgraph* dec_gf = build_vae_decoder_graph(ctx, actual_frames);
-    auto t_vae_alloc0 = std::chrono::high_resolution_clock::now();
-    ggml_backend_sched_reset(ctx->sched);
-
-    // Force the entire VAE decoder graph onto CPU on backends with
-    // known issues running it as a single command buffer. The decoder
-    // is a 7-stage σ-VAE conv stack (6 transposed convs, 3200x upsample);
-    // depending on hardware it can:
-    //   - Metal: trip Apple's interactivity watchdog
-    //     (kIOGPUCommandBufferCallbackErrorImpactingInteractivity) when
-    //     compute exceeds ~5s, even with n_cb bumped to 4.
-    //   - Vulkan on Intel iGPUs (Arc/Iris/UHD): exceed
-    //     `maxComputeWorkGroupCount` for the largest transposed-conv
-    //     dispatches and abort with the assertion at
-    //     ggml-vulkan.cpp:6612 (issue #52, geneing).
-    // Encoders / LM / diffusion stay on the active backend — only this
-    // one graph runs CPU. Net cost on M1: ~10-15% of TTS time. Override
-    // via VIBEVOICE_VAE_BACKEND={auto|cpu|gpu}.
-    if (vibevoice_vae_should_use_cpu(ctx->backend, ctx->backend_cpu)) {
-        for (int i = 0; i < ggml_graph_n_nodes(dec_gf); i++) {
-            ggml_backend_sched_set_tensor_backend(ctx->sched, ggml_graph_node(dec_gf, i), ctx->backend_cpu);
-        }
-    }
-
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, dec_gf)) {
-        fprintf(stderr, "vibevoice TTS: decoder graph alloc failed\n");
-        return nullptr;
-    }
-
-    ggml_backend_tensor_set(ggml_graph_get_tensor(dec_gf, "dec_latent"), scaled_latent.data(), 0,
-                            total_latent * sizeof(float));
-    auto t_vae_compute0 = std::chrono::high_resolution_clock::now();
-
-    if (ggml_backend_sched_graph_compute(ctx->sched, dec_gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "vibevoice TTS: decoder compute failed\n");
+    // VAE decode of the full latent sequence in one pass. The CPU-force /
+    // Metal-watchdog / Vulkan-workgroup workarounds live inside
+    // vibevoice_vae_decode_range (shared with the streaming path).
+    std::vector<float> raw_audio = vibevoice_vae_decode_range(ctx, scaled_latent.data(), actual_frames);
+    if (raw_audio.empty()) {
         return nullptr;
     }
     auto t_vae_compute1 = std::chrono::high_resolution_clock::now();
     if (getenv("VIBEVOICE_BENCH")) {
-        fprintf(stderr, "  BENCH VAE (%d frames→%dx): build=%.0fms, alloc=%.0fms, compute=%.0fms, ops=%d\n",
-                actual_frames, actual_frames * 3200,
-                std::chrono::duration<double, std::milli>(t_vae_alloc0 - t_vae_build0).count(),
-                std::chrono::duration<double, std::milli>(t_vae_compute0 - t_vae_alloc0).count(),
-                std::chrono::duration<double, std::milli>(t_vae_compute1 - t_vae_compute0).count(),
-                ggml_graph_n_nodes(dec_gf));
+        fprintf(stderr, "  BENCH VAE (%d frames→%dx): decode=%.0fms\n", actual_frames, actual_frames * 3200,
+                std::chrono::duration<double, std::milli>(t_vae_compute1 - t_vae_build0).count());
     }
 
-    ggml_tensor* audio_out = ggml_graph_get_tensor(dec_gf, "dec_audio");
-    int n_ch = (int)audio_out->ne[0];
-    int n_audio = (int)audio_out->ne[1];
-    int total_audio = n_ch * n_audio;
+    int total_audio = (int)raw_audio.size();
 
     const auto tts_t1 = std::chrono::high_resolution_clock::now();
     if (verbosity >= 1) {
@@ -4327,9 +4768,6 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
                 prefill_ms, 100.0 * prefill_ms / total_ms, ar_ms, 100.0 * ar_ms / total_ms, vae_ms,
                 100.0 * vae_ms / total_ms);
     }
-
-    std::vector<float> raw_audio((size_t)total_audio);
-    ggml_backend_tensor_get(audio_out, raw_audio.data(), 0, (size_t)total_audio * sizeof(float));
 
     // ── Start trim: the σ-VAE decoder's first ~100ms is a deterministic
     //               warmup transient from zero-pad propagation through 7
@@ -4421,6 +4859,155 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     if (out_n_samples)
         *out_n_samples = trimmed_len;
     return out_buf;
+}
+
+// ── Streaming TTS session ───────────────────────────────────────────────────
+// A worker thread runs vibevoice_realtime_run() in streaming mode. push_text()
+// appends raw UTF-8 to a buffer; the worker's pull_text hook tokenizes complete
+// (whitespace-delimited) words on demand and hands the realtime loop windows of
+// token-ids, blocking until text is available or end() is called. emit_audio
+// forwards each decoded PCM chunk to the user callback (on the worker thread).
+struct vibevoice_tts_stream {
+    vibevoice_context* ctx = nullptr;
+    vibevoice_on_audio on_audio = nullptr;
+    void* user = nullptr;
+    std::thread worker;
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::string full_text;             // all UTF-8 pushed so far (never consumed)
+    size_t emitted_tokens = 0;         // count handed to the generation loop
+    bool ended = false;                // producer called end()/free()
+    bool done = false;                 // worker finished
+    std::atomic<bool> aborted{false};  // producer called abort() — stop generating ASAP
+    int rc = 0;
+};
+
+static void vibevoice_tts_stream_worker(vibevoice_tts_stream* st) {
+    vibevoice_stream_ctl ctl;
+    ctl.pull_text = [st](int max_tokens, std::vector<int32_t>& out, bool* eof) -> bool {
+        std::unique_lock<std::mutex> lk(st->mtx);
+        for (;;) {
+            // Tokenize the WHOLE accumulated text from the start up to the last
+            // whitespace (the stable prefix — BPE does not merge across a space),
+            // or everything once ended. Tokenizing the full prefix (rather than
+            // per-chunk) makes the token sequence identical to the batch path's
+            // whole-text tokenization, which the generation is sensitive to. We
+            // emit only tokens beyond what we've already handed out; the prefix is
+            // stable as more text arrives, so earlier tokens never change.
+            std::vector<int32_t> toks;
+            if (st->ended) {
+                // Match the batch path, which tokenizes `text + "\n"` — the
+                // trailing newline is part of the utterance the model was trained
+                // to close on, so it must be present for the final window/EOS to
+                // behave like batch.
+                toks = tokenize_text_greedy(st->ctx->model, (st->full_text + "\n").c_str());
+            } else {
+                // Cut AT the last whitespace, not after it. Qwen2 byte-level
+                // BPE encodes a leading space as a "Ġ" prefix on the next
+                // word: tokenize("Good ") = [Good, Ġ] (Ġ as a standalone
+                // token id 220), but tokenize("Good morning") = [Good,
+                // Ġmorning] — the Ġ gets absorbed into the next word. If we
+                // emit the standalone Ġ now, it becomes the wrong token
+                // retroactively once more text arrives, and the synth state
+                // diverges (audio sounds like gibberish with occasional real
+                // words). Cutting BEFORE the trailing whitespace means we
+                // only emit tokens for completed words; the space waits to
+                // merge into the next word's Ġ-prefix.
+                size_t ws = st->full_text.find_last_of(" \t\n");
+                size_t cut = (ws == std::string::npos) ? 0 : ws;
+                if (cut > 0)
+                    toks = tokenize_text_greedy(st->ctx->model, st->full_text.substr(0, cut).c_str());
+            }
+            if (st->emitted_tokens < toks.size()) {
+                int n = std::min((int)(toks.size() - st->emitted_tokens), max_tokens);
+                for (int i = 0; i < n; i++)
+                    out.push_back(toks[st->emitted_tokens + i]);
+                st->emitted_tokens += (size_t)n;
+                if (eof)
+                    *eof = st->ended && st->emitted_tokens >= toks.size();
+                return true;
+            }
+            if (st->ended || st->aborted.load()) {
+                if (eof)
+                    *eof = true;
+                return true; // no tokens, never any more
+            }
+            st->cv.wait(lk); // block for more text / end()
+        }
+    };
+    ctl.emit_audio = [st](const float* pcm, int n_samples, bool /*final_chunk*/) {
+        if (st->on_audio && pcm && n_samples > 0)
+            st->on_audio(pcm, n_samples, st->user);
+    };
+    ctl.should_abort = [st]() -> bool { return st->aborted.load(); };
+
+    float* r = vibevoice_realtime_run(st->ctx, /*text=*/nullptr, &ctl, /*out_n_samples=*/nullptr);
+    {
+        std::lock_guard<std::mutex> lk(st->mtx);
+        st->rc = r ? 0 : -1;
+        st->done = true;
+    }
+    st->cv.notify_all();
+}
+
+extern "C" struct vibevoice_tts_stream* vibevoice_tts_stream_begin(struct vibevoice_context* ctx,
+                                                                   vibevoice_on_audio on_audio, void* user) {
+    if (!ctx)
+        return nullptr;
+    auto* st = new vibevoice_tts_stream();
+    st->ctx = ctx;
+    st->on_audio = on_audio;
+    st->user = user;
+    st->worker = std::thread(vibevoice_tts_stream_worker, st);
+    return st;
+}
+
+extern "C" int vibevoice_tts_stream_push_text(struct vibevoice_tts_stream* st, const char* utf8) {
+    if (!st || !utf8)
+        return -1;
+    {
+        std::lock_guard<std::mutex> lk(st->mtx);
+        if (st->ended)
+            return -1; // text after end() is ignored
+        st->full_text += utf8;
+    }
+    st->cv.notify_all();
+    return 0;
+}
+
+extern "C" int vibevoice_tts_stream_end(struct vibevoice_tts_stream* st) {
+    if (!st)
+        return -1;
+    {
+        std::lock_guard<std::mutex> lk(st->mtx);
+        st->ended = true;
+    }
+    st->cv.notify_all();
+    return 0;
+}
+
+extern "C" void vibevoice_tts_stream_abort(struct vibevoice_tts_stream* st) {
+    if (!st)
+        return;
+    {
+        std::lock_guard<std::mutex> lk(st->mtx);
+        st->aborted.store(true);
+        st->ended = true;
+    }
+    st->cv.notify_all(); // wake a pull_text() blocked waiting for more text
+}
+
+extern "C" void vibevoice_tts_stream_free(struct vibevoice_tts_stream* st) {
+    if (!st)
+        return;
+    {
+        std::lock_guard<std::mutex> lk(st->mtx);
+        st->ended = true;
+    }
+    st->cv.notify_all();
+    if (st->worker.joinable())
+        st->worker.join();
+    delete st;
 }
 
 extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float* samples, int n_samples) {

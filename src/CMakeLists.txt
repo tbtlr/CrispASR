@@ -1035,6 +1035,75 @@ target_include_directories(firered-vad PUBLIC .)
 target_compile_features   (firered-vad PUBLIC cxx_std_17)
 target_link_libraries     (firered-vad PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 
+# ---------------------------------------------------------------------------
+# crispasr-tts — minimal shared lib for embedders that want VibeVoice TTS +
+# FireRedVAD + Moonshine (batch + streaming) without dragging in the rest of
+# libcrispasr.dylib (full ASR backends, chat, diarization, language id, audio
+# decoder, espeak-ng dependency). Use it from another project by linking
+# against libcrispasr-tts and including vibevoice.h / firered_vad.h /
+# moonshine.h / moonshine_streaming.h.
+#
+# Build directly with:
+#     cmake --build build --target crispasr-tts
+# (much faster + smaller than the full libcrispasr.dylib).
+add_library(crispasr-tts SHARED
+    vibevoice.h
+    vibevoice.cpp
+    vibevoice_wav_ref.h
+    firered_vad.h
+    firered_vad.cpp
+    # Moonshine ASR (UsefulSensors). Designed for short-utterance voice
+    # commands — used by embedders for wake-word detection and barge-in
+    # phrase detection. Streaming wrapper polls the batch transcribe over
+    # a rolling window. Tokenizer is intentionally bundled in (not linked
+    # via moonshine_tokenizer STATIC target) so the shared lib is fully
+    # self-contained.
+    moonshine-tokenizer.h
+    moonshine-tokenizer.cpp
+    moonshine.h
+    moonshine.cpp
+    moonshine-impl.h
+    moonshine-audio.h
+    moonshine_streaming.h
+    moonshine_streaming.cpp
+)
+# DeepFilterNet3 streaming speech enhancer — used as a post-filter on
+# VibeVoice TTS output by downstream embedders that want to scrub
+# background-music artefacts (e.g. gemma_voice). No miniaudio / device-IO
+# dependency; only ggml + core/gguf_loader (already PRIVATE crispasr-core).
+if (CRISPASR_DFN)
+    target_sources(crispasr-tts PRIVATE
+        dfn.h
+        dfn.cpp
+        dfn_debug.h
+        dfn_fft.h
+        dfn_fft.cpp
+        # Polyphase Kaiser resampler — also lives in crispasr-core (which
+        # crispasr-tts links PRIVATE), but the static-lib linker drops .o
+        # files nothing inside crispasr-tts references. Embedders that want
+        # to upsample 24 → 48 kHz for the DFN post-filter (e.g. gemma_voice)
+        # need this symbol exported by the dylib, so compile it in directly.
+        core/audio_resample.h
+        core/audio_resample.cpp
+    )
+    target_compile_definitions(crispasr-tts PUBLIC CRISPASR_DFN=1)
+endif()
+set_target_properties(crispasr-tts PROPERTIES
+    VERSION         ${PROJECT_VERSION}
+    SOVERSION       ${SOVERSION}
+    MACHO_CURRENT_VERSION 0
+)
+target_include_directories(crispasr-tts PUBLIC .)
+target_compile_features   (crispasr-tts PUBLIC cxx_std_17)
+target_link_libraries     (crispasr-tts
+    PUBLIC  ggml ggml-base ggml-cpu Threads::Threads
+    PRIVATE crispasr-core
+)
+if (BUILD_SHARED_LIBS)
+    target_compile_definitions(crispasr-tts PRIVATE CRISPASR_BUILD)
+    target_compile_definitions(crispasr-tts PUBLIC  CRISPASR_SHARED)
+endif()
+
 # marblenet-vad — NVIDIA MarbleNet VAD (1D separable CNN, 91.5K params)
 add_library(marblenet-vad STATIC marblenet_vad.h marblenet_vad.cpp)
 set_target_properties(marblenet-vad PROPERTIES POSITION_INDEPENDENT_CODE ON)

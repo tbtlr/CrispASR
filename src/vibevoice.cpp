@@ -14,6 +14,7 @@
 #define _USE_MATH_DEFINES
 
 #include "vibevoice.h"
+#include <atomic>   // Linux/libstdc++ needs this explicitly (macOS libc++ pulls it in transitively)
 #include "core/attention.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"

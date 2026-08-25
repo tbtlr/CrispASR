@@ -1066,6 +1066,15 @@ add_library(crispasr-tts SHARED
     moonshine-audio.h
     moonshine_streaming.h
     moonshine_streaming.cpp
+    # Parakeet (NVIDIA TDT/CTC/RNNT) and Kyutai STT. Compiled in rather than
+    # linked from their STATIC targets for the same reason moonshine's
+    # tokenizer is: a static archive's .o files are dropped when nothing
+    # inside this library references them, and embedders reach these through
+    # the dylib's exports.
+    parakeet.h
+    parakeet.cpp
+    kyutai_stt.h
+    kyutai_stt.cpp
 )
 # DeepFilterNet3 streaming speech enhancer — used as a post-filter on
 # VibeVoice TTS output by downstream embedders that want to scrub
@@ -1099,6 +1108,13 @@ target_link_libraries     (crispasr-tts
     PUBLIC  ggml ggml-base ggml-cpu Threads::Threads
     PRIVATE crispasr-core
 )
+if (NOT BUILD_SHARED_LIBS)
+    # Static build: a shared crispasr-tts only contains what it explicitly links,
+    # but embedders (gemma-voice's gv-serve) reference the alternative STT
+    # engines directly. Pull them in so they resolve AND share this library's
+    # private ggml rather than binding to the host application's copy.
+    target_link_libraries(crispasr-tts PRIVATE parakeet kyutai-stt)
+endif()
 if (BUILD_SHARED_LIBS)
     target_compile_definitions(crispasr-tts PRIVATE CRISPASR_BUILD)
     target_compile_definitions(crispasr-tts PUBLIC  CRISPASR_SHARED)

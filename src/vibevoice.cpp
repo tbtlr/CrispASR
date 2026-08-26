@@ -1264,13 +1264,26 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, K_perm, k_view));
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, V_perm, v_view));
 
-                // Read full K, V from cache
+                // Read full K, V from cache.
+                //
+                // NO ggml_cont here. The cont copied the entire K and V
+                // history for EVERY layer on EVERY frame -- O(n_past)
+                // device-memory traffic per layer per step.
+                // ggml_flash_attn_ext consumes strided views directly (this is
+                // how llama.cpp passes its own KV cache), so the copy buys
+                // nothing.
+                //
+                // Honest accounting: dropping it did NOT measurably move TTS
+                // latency on its own. The real bottleneck was the quadratic
+                // conv_transpose_1d CUDA kernel. This is kept because it is
+                // strictly less work and the copies grow with utterance
+                // length -- but do not credit it with the speedup.
                 ggml_tensor* Kfull =
-                    ggml_cont(ctx0, ggml_view_3d(ctx0, ctx->kv_k, kvp.head_dim, Lk, kvp.n_kv_heads, ctx->kv_k->nb[1],
-                                                 ctx->kv_k->nb[2], (size_t)il * ctx->kv_k->nb[3]));
+                    ggml_view_3d(ctx0, ctx->kv_k, kvp.head_dim, Lk, kvp.n_kv_heads, ctx->kv_k->nb[1],
+                                 ctx->kv_k->nb[2], (size_t)il * ctx->kv_k->nb[3]);
                 ggml_tensor* Vfull =
-                    ggml_cont(ctx0, ggml_view_3d(ctx0, ctx->kv_v, kvp.head_dim, Lk, kvp.n_kv_heads, ctx->kv_v->nb[1],
-                                                 ctx->kv_v->nb[2], (size_t)il * ctx->kv_v->nb[3]));
+                    ggml_view_3d(ctx0, ctx->kv_v, kvp.head_dim, Lk, kvp.n_kv_heads, ctx->kv_v->nb[1],
+                                 ctx->kv_v->nb[2], (size_t)il * ctx->kv_v->nb[3]);
 
                 // Permute Q for flash-attn: [hd, T, nh]
                 Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));

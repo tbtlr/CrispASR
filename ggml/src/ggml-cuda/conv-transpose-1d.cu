@@ -17,20 +17,33 @@ static __global__ void conv_transpose_1d_kernel(
 
     float accumulator = 0;
 
+    const int idx = global_index % dst_ne0;
+
+    // Only the inputs i with  idx - K < i*s0 <= idx  contribute; that is at most
+    // ceil(K / s0) taps. The original loop walked ALL src1_ne0 input positions
+    // and `continue`d past the rest, making the kernel O(T_out * C_in * T_in),
+    // i.e. quadratic in sequence length. For an audio decoder upsampling 3200x
+    // that dominates everything (measured: 9 latent frames took 31 s on CUDA vs
+    // ~1.2 s on the CPU backend). Compute the bounds instead.
+    int i_min = 0;
+    const int lo = idx - src0_ne0;          // idx - K
+    if (lo >= 0) {
+        i_min = lo / s0 + 1;                // smallest i with i*s0 > idx - K
+    }
+    int i_max = idx / s0;                   // largest i with i*s0 <= idx
+    if (i_max > src1_ne0 - 1) {
+        i_max = src1_ne0 - 1;
+    }
+
     for (int c = 0; c < src0_ne2; c++) {
-        int idx = global_index % dst_ne0;
+        const int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
+        const int input_offset = src1_ne0 * c;
 
-        int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
-        int input_offset = src1_ne0 * c;
+        for (int i = i_min; i <= i_max; i++) {
+            const int weight_idx = idx - i*s0;
 
-        for (int i = 0; i < src1_ne0; i++) {
-            if (!(idx >= i*s0 && idx < i*s0 + src0_ne0)) {
-                continue;
-            }
-            int weight_idx = idx - i*s0;
-
-            float kernel_weight = ggml_cuda_cast<float>(src0[kernel_offset + weight_idx]);
-            float input_value =  src1[input_offset+i];
+            const float kernel_weight = ggml_cuda_cast<float>(src0[kernel_offset + weight_idx]);
+            const float input_value =  src1[input_offset+i];
 
             accumulator += kernel_weight * input_value;
         }

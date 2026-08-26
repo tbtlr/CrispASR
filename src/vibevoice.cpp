@@ -2290,7 +2290,13 @@ static std::vector<float> vibevoice_vae_decode_range(vibevoice_context* ctx, con
     int vae_dim = ctx->model.hp.vae_dim_acoustic;
     size_t total_latent = (size_t)n_frames * vae_dim;
 
+    const bool vae_bench = getenv("VIBEVOICE_BENCH") != nullptr;
+    auto _t = [] { return std::chrono::high_resolution_clock::now(); };
+    auto _ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    auto t0 = _t();
+
     ggml_cgraph* dec_gf = build_vae_decoder_graph(ctx, n_frames);
+    auto t1 = _t();
     ggml_backend_sched_reset(ctx->sched);
     if (!ctx->vae_streaming_gpu && vibevoice_vae_should_use_cpu(ctx->backend, ctx->backend_cpu)) {
         for (int i = 0; i < ggml_graph_n_nodes(dec_gf); i++)
@@ -2300,12 +2306,18 @@ static std::vector<float> vibevoice_vae_decode_range(vibevoice_context* ctx, con
         fprintf(stderr, "vibevoice TTS: decoder graph alloc failed\n");
         return {};
     }
+    auto t2 = _t();
     ggml_backend_tensor_set(ggml_graph_get_tensor(dec_gf, "dec_latent"), scaled_latent, 0,
                             total_latent * sizeof(float));
     if (ggml_backend_sched_graph_compute(ctx->sched, dec_gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "vibevoice TTS: decoder compute failed\n");
         return {};
     }
+    auto t3 = _t();
+    if (vae_bench)
+        fprintf(stderr, "  VAE[%d frames, %d nodes, %s]: build=%.0fms alloc=%.0fms compute=%.0fms\n",
+                n_frames, ggml_graph_n_nodes(dec_gf), ctx->vae_streaming_gpu ? "gpu" : "cpu",
+                _ms(t0, t1), _ms(t1, t2), _ms(t2, t3));
     ggml_tensor* audio_out = ggml_graph_get_tensor(dec_gf, "dec_audio");
     int total_audio = (int)audio_out->ne[0] * (int)audio_out->ne[1];
     std::vector<float> raw((size_t)total_audio);

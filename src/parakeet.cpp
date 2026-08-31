@@ -236,7 +236,7 @@ static ggml_tensor* require(parakeet_model& m, const char* name) {
 // ===========================================================================
 
 static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, const char* path,
-                                ggml_backend_t backend) {
+                                ggml_backend_t backend, int verbosity) {
     // ---- pass 1: read hparams + vocab via metadata-only context ----
     {
         gguf_context* gctx = core_gguf::open_metadata(path);
@@ -403,13 +403,15 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
         if (it_w != model.tensors.end() && it_b != model.tensors.end()) {
             model.ctc_w = it_w->second;
             model.ctc_b = it_b->second;
-            fprintf(stderr, "parakeet: CTC head loaded (vocab=%u)\n", model.ctc_vocab_size);
+            if (verbosity >= 1)
+                fprintf(stderr, "parakeet: CTC head loaded (vocab=%u)\n", model.ctc_vocab_size);
         } else {
             fprintf(stderr, "parakeet: has_ctc=true but ctc tensors missing — falling back to TDT\n");
             model.has_ctc = false;
         }
     }
 
+    if (verbosity >= 1)
     fprintf(stderr, "parakeet: vocab=%u  d_model=%u  n_layers=%u  n_heads=%u  ff=%u  pred=%u  joint=%u\n",
             model.hparams.vocab_size, model.hparams.d_model, model.hparams.n_layers, model.hparams.n_heads,
             model.hparams.ff_dim, model.hparams.pred_hidden, model.hparams.joint_hidden);
@@ -584,7 +586,7 @@ static void parakeet_apply_znorm(float* mel, int T, int n_mels, const double* ba
 // the BN block entirely.
 // ===========================================================================
 
-static void parakeet_fold_batchnorm(parakeet_model& model) {
+static void parakeet_fold_batchnorm(parakeet_model& model, int verbosity) {
     const int d = (int)model.hparams.d_model;
     const int K = (int)model.hparams.conv_kernel;
     const float eps = 1e-5f;
@@ -639,7 +641,8 @@ static void parakeet_fold_batchnorm(parakeet_model& model) {
         ggml_backend_tensor_set(e.conv_dw_b, dw_b.data(), 0, d * sizeof(float));
     }
 
-    fprintf(stderr, "parakeet: BN folded into conv_dw weights for %u layers\n", model.hparams.n_layers);
+    if (verbosity >= 1)
+        fprintf(stderr, "parakeet: BN folded into conv_dw weights for %u layers\n", model.hparams.n_layers);
 }
 
 // ===========================================================================
@@ -1478,13 +1481,13 @@ extern "C" struct parakeet_context* parakeet_init_from_file(const char* path_mod
     if (!ctx->backend)
         ctx->backend = ctx->backend_cpu;
 
-    if (!parakeet_load_model(ctx->model, ctx->vocab, path_model, ctx->backend)) {
+    if (!parakeet_load_model(ctx->model, ctx->vocab, path_model, ctx->backend, params.verbosity)) {
         fprintf(stderr, "parakeet: failed to load '%s'\n", path_model);
         parakeet_free(ctx);
         return nullptr;
     }
 
-    parakeet_fold_batchnorm(ctx->model);
+    parakeet_fold_batchnorm(ctx->model, params.verbosity);
 
     // Hybrid TDT+CTC models with a single-LSTM predictor (parakeet-tdt_ctc-110m
     // has pred_layers=1) can only decode via the CTC head — TDT decode requires

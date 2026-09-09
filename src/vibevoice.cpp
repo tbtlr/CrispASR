@@ -4336,6 +4336,24 @@ static float* vibevoice_realtime_run(struct vibevoice_context* ctx, const char* 
     // producing the next (steady-state generation is several× real time), keeping
     // playback gap-free without a startup buffer.
     const int kEmitChunkFramesMax = 32; // ~4.3 s cap — amortizes the receptive-field decode
+    // How the chunk size grows after each emit.
+    //
+    // It used to double. That is right when generation runs several times
+    // real time, which is the assumption the comment above records — a chunk
+    // then always finishes well before the previous one has played out. It is
+    // wrong nearer to real time: doubling makes the NEXT chunk's generation
+    // time grow exactly as fast as THIS chunk's playing time, so above a
+    // realtime factor of about 0.5 the second chunk is always late, and always
+    // in the same place, one boundary in. Measured on an M4 Max at rtf 0.65:
+    // a 3-frame first chunk plays for 400 ms while a 6-frame second needs
+    // 520 ms to make.
+    //
+    // Three halves keeps the amortisation — the size still climbs to the cap
+    // in a handful of emits — while keeping each chunk's generation inside the
+    // previous chunk's playback: 4 frames needs 346 ms against that same
+    // 400 ms. Always at least one frame bigger, so it cannot stall.
+    auto gl_next_emit_chunk = [](int n) { return std::max(n + 1, (n * 3) / 2); };
+
     // First chunk size is overridable (ctx params) because it is the dominant
     // term in time-to-first-audio; see vibevoice.h.
     int emit_chunk = 6;                 // ~0.8 s first chunk; doubles after each emit
@@ -4579,7 +4597,7 @@ static float* vibevoice_realtime_run(struct vibevoice_context* ctx, const char* 
             // are ~160 ms of decode sitting in front of the first sound.
             if (streaming && append_audio_frame && emit_ready(/*final_chunk=*/false)) {
                 emit_window(/*final_chunk=*/false);
-                emit_chunk = std::min(kEmitChunkFramesMax, emit_chunk * 2);
+                emit_chunk = std::min(kEmitChunkFramesMax, gl_next_emit_chunk(emit_chunk));
             }
             if (fi == 0) {
                 vibevoice_dump_f32(dump_dir, "tts_latent_frame0", z.data(), z.size());
@@ -4704,7 +4722,7 @@ static float* vibevoice_realtime_run(struct vibevoice_context* ctx, const char* 
         // the chunk size ramps up to the cap.
         if (emit_ready(/*final_chunk=*/false)) {
             emit_window(/*final_chunk=*/false);
-            emit_chunk = std::min(kEmitChunkFramesMax, emit_chunk * 2);
+            emit_chunk = std::min(kEmitChunkFramesMax, gl_next_emit_chunk(emit_chunk));
         }
 
         // Streaming: pull the next text window before feeding it. ensure_text

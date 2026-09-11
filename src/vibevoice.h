@@ -155,6 +155,10 @@ int vibevoice_tts_stream_end(struct vibevoice_tts_stream* st);
 // Abort generation ASAP (user interrupt / shutdown). The worker stops emitting
 // further audio; free() then joins quickly instead of synthesizing the rest.
 void vibevoice_tts_stream_abort(struct vibevoice_tts_stream* st);
+// True once the worker has finished: every chunk has been delivered, or the
+// stream was aborted. Non-blocking, so a caller that pulls audio from its
+// own queue can learn the reply is over without joining the worker.
+bool vibevoice_tts_stream_done(struct vibevoice_tts_stream* st);
 // Signal end (if not already), join the worker thread, and release the session.
 void vibevoice_tts_stream_free(struct vibevoice_tts_stream* st);
 

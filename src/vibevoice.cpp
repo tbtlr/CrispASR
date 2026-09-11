@@ -5059,7 +5059,13 @@ extern "C" void vibevoice_tts_stream_abort(struct vibevoice_tts_stream* st) {
     st->cv.notify_all(); // wake a pull_text() blocked waiting for more text
 }
 
-extern "C" void vibevoice_tts_stream_free(struct vibevoice_tts_stream* st) {
+extern "C" bool vibevoice_tts_stream_done(struct vibevoice_tts_stream* st) {
+    if (!st) return true;
+    std::lock_guard<std::mutex> lk(st->mtx);
+    return st->done;
+}
+
+void vibevoice_tts_stream_free(struct vibevoice_tts_stream* st) {
     if (!st)
         return;
     {

@@ -4354,6 +4354,22 @@ static float* vibevoice_realtime_run(struct vibevoice_context* ctx, const char* 
     // 400 ms. Always at least one frame bigger, so it cannot stall.
     auto gl_next_emit_chunk = [](int n) { return std::max(n + 1, (n * 3) / 2); };
 
+    // Flush on silence. On some seeds the model finishes the sentence, then
+    // generates half a second or more of silence before its end-of-speech
+    // fires, sometimes followed by a fragment or a repeat. Pending audio is
+    // otherwise emitted only when a chunk fills or at the very end, so the
+    // last words of such a reply arrive late by the length of that silence:
+    // measured as a 285 ms gap before the last word on about four seeds in a
+    // hundred. Silence is visible in the latents: a silent frame's L2 norm is
+    // about 2 against 5 to 12 for speech, and the lead-in the model generates
+    // ahead of every utterance supplies that reference. Once the last few
+    // frames are silent and something real is pending, emit it now.
+    const int kTailSilentFrames = 4;       // ~530 ms of silence before flushing
+    const float kSilentNormRatio = 1.6f;   // silent: norm below this times the lead's
+    float silent_norm_ref = 0.0f;          // set from the first frames, which are the lead
+    int silent_run = 0;                    // silent frames generated in a row
+    int pending_sound_frames = 0;          // real frames generated since the last emit
+
     // First chunk size is overridable (ctx params) because it is the dominant
     // term in time-to-first-audio; see vibevoice.h.
     int emit_chunk = 6;                 // ~0.8 s first chunk; doubles after each emit
@@ -4588,6 +4604,19 @@ static float* vibevoice_realtime_run(struct vibevoice_context* ctx, const char* 
             if (append_audio_frame)
                 all_latents.insert(all_latents.end(), z.begin(), z.end());
 
+            // Silence tracking on the latent just generated (see flush on silence).
+            if (append_audio_frame) {
+                float ss = 0.0f;
+                for (float v : z) ss += v * v;
+                const float norm = sqrtf(ss);
+                const int frame_index = (int)all_latents.size() / vae_dim - 1;
+                if (frame_index >= 1 && frame_index <= 3)   // the lead: frame 0 sometimes carries a click
+                    silent_norm_ref = (silent_norm_ref == 0.0f) ? norm : std::min(silent_norm_ref, norm);
+                const bool silent = silent_norm_ref > 0.0f && norm < kSilentNormRatio * silent_norm_ref;
+                if (silent) silent_run++;
+                else { silent_run = 0; pending_sound_frames++; }
+            }
+
             // Streaming: test for an emit after EVERY frame, not only at the end
             // of the text window below. The interleave produces ~6 speech frames
             // per window, so checking only after the loop means the first chunk
@@ -4598,6 +4627,10 @@ static float* vibevoice_realtime_run(struct vibevoice_context* ctx, const char* 
             if (streaming && append_audio_frame && emit_ready(/*final_chunk=*/false)) {
                 emit_window(/*final_chunk=*/false);
                 emit_chunk = std::min(kEmitChunkFramesMax, gl_next_emit_chunk(emit_chunk));
+                pending_sound_frames = 0;
+            } else if (streaming && append_audio_frame && silent_run >= kTailSilentFrames && pending_sound_frames > 0) {
+                emit_window(/*final_chunk=*/false);   // flush on silence: the words are done, send them
+                pending_sound_frames = 0;
             }
             if (fi == 0) {
                 vibevoice_dump_f32(dump_dir, "tts_latent_frame0", z.data(), z.size());
@@ -4723,6 +4756,7 @@ static float* vibevoice_realtime_run(struct vibevoice_context* ctx, const char* 
         if (emit_ready(/*final_chunk=*/false)) {
             emit_window(/*final_chunk=*/false);
             emit_chunk = std::min(kEmitChunkFramesMax, gl_next_emit_chunk(emit_chunk));
+            pending_sound_frames = 0;
         }
 
         // Streaming: pull the next text window before feeding it. ensure_text
